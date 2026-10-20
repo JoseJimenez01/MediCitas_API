@@ -1,0 +1,71 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: medical-integration
+  namespace: restaurant-api
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      enableServiceLinks: false
+      restartPolicy: Never
+      containers:
+      - name: tests
+        image: restaurant-api-tests:local
+        imagePullPolicy: Never
+        env:
+        - name: TEST_API_BASE_URL
+          value: http://restaurant-api:8080
+        - name: TEST_KEYCLOAK_TOKEN_URL
+          value: http://keycloak:8080/realms/restaurant/protocol/openid-connect/token
+        - name: POSTGRES_HOST
+          value: postgres
+        - name: POSTGRES_PORT
+          value: '5432'
+        - name: POSTGRES_DB
+          value: restaurantdb
+        - name: TEST_USERNAME
+          valueFrom:
+            secretKeyRef:
+              name: restaurant-secrets
+              key: K6_WRITER_USERNAME
+        - name: TEST_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: restaurant-secrets
+              key: K6_WRITER_PASSWORD
+        - name: TEST_USERNAME_NOROLE
+          valueFrom:
+            secretKeyRef:
+              name: restaurant-secrets
+              key: K6_READER_USERNAME
+        - name: TEST_PASSWORD_NOROLE
+          valueFrom:
+            secretKeyRef:
+              name: restaurant-secrets
+              key: K6_READER_PASSWORD
+        - name: MED_TEST_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: restaurant-secrets
+              key: MED_TEST_PASSWORD
+        - name: POSTGRES_USER
+          valueFrom:
+            secretKeyRef:
+              name: restaurant-secrets
+              key: APP_DB_USER
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: restaurant-secrets
+              key: APP_DB_PASSWORD
+        - name: TEST_DB_ADMIN_USER
+          valueFrom:
+            secretKeyRef:
+              name: restaurant-secrets
+              key: POSTGRES_USER
+        - name: TEST_DB_ADMIN_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: restaurant-secrets
+              key: POSTGRES_PASSWORD

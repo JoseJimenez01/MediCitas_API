@@ -1,0 +1,41 @@
+# Excluye del contexto de construccion (y por tanto de la imagen) todo lo que no le
+# corresponde al servicio en tiempo de ejecucion.
+
+# Historial de Git y metadatos del repositorio
+.git
+.gitignore
+
+# Entorno de desarrollo (IDE)
+.vs
+.vscode
+**/*.csproj.user
+
+# Dependencias del entorno de desarrollo y artefactos de compilacion
+bin/
+obj/
+**/bin/
+**/obj/
+artifacts/
+TestResults/
+
+# Secretos: el .env real NO entra al contexto de construccion
+.env
+.env.*
+
+# Archivos de orquestacion y documentacion: no forman parte del servicio
+Dockerfile
+docker-compose*.yml
+README.md
+docs/
+db/
+keycloak/
+k8s/
+scripts/*
+!scripts/api-entrypoint.sh
+tests/
+INTEGRATION_CONTRACT.md
+
+# Resto
+*.log
+.DS_Store
+Thumbs.db

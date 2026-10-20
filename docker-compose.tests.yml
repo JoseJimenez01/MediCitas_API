@@ -1,0 +1,28 @@
+services:
+  tests:
+    build:
+      context: .
+      target: tests
+    profiles:
+    - tests
+    environment:
+      TEST_API_BASE_URL: http://api:8080
+      TEST_KEYCLOAK_TOKEN_URL: http://auth:8080/realms/restaurant/protocol/openid-connect/token
+      TEST_CLIENT_ID: restaurant-api
+      TEST_USERNAME: ${K6_WRITER_USERNAME:-escritor}
+      TEST_PASSWORD: ${K6_WRITER_PASSWORD:?}
+      TEST_USERNAME_NOROLE: ${K6_READER_USERNAME:-lector}
+      TEST_PASSWORD_NOROLE: ${K6_READER_PASSWORD:?}
+      MED_TEST_PASSWORD: ${MED_TEST_PASSWORD:?}
+      POSTGRES_HOST: bd
+      POSTGRES_PORT: '5432'
+      POSTGRES_DB: ${POSTGRES_DB:-restaurantdb}
+      POSTGRES_USER: ${APP_DB_USER:-medicitas_app}
+      POSTGRES_PASSWORD: ${APP_DB_PASSWORD:?}
+      TEST_DB_ADMIN_USER: ${POSTGRES_USER}
+      TEST_DB_ADMIN_PASSWORD: ${POSTGRES_PASSWORD}
+    depends_on:
+      api:
+        condition: service_healthy
+      auth:
+        condition: service_healthy

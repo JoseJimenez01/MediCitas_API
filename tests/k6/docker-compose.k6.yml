@@ -1,0 +1,26 @@
+services:
+  k6:
+    image: grafana/k6:0.57.0
+    profiles:
+    - tests
+    volumes:
+    - ./tests/k6:/scripts:ro
+    environment:
+      API_URL: http://api:8080
+      KEYCLOAK_URL: http://auth:8080
+      KEYCLOAK_REALM: ${KEYCLOAK_REALM:-restaurant}
+      KEYCLOAK_CLIENT_ID: ${KEYCLOAK_CLIENT_ID:-restaurant-api}
+      KEYCLOAK_CLIENT_SECRET: ${KEYCLOAK_CLIENT_SECRET:-}
+      K6_WRITER_USERNAME: ${K6_WRITER_USERNAME}
+      K6_WRITER_PASSWORD: ${K6_WRITER_PASSWORD}
+      K6_READER_USERNAME: ${K6_READER_USERNAME}
+      K6_READER_PASSWORD: ${K6_READER_PASSWORD}
+      RESOURCE_PATH: ${RESOURCE_PATH:-/reservas}
+    depends_on:
+      api:
+        condition: service_healthy
+      auth:
+        condition: service_healthy
+    command:
+    - run
+    - /scripts/integration.js

@@ -1,0 +1,379 @@
+{
+  "realm": "restaurant",
+  "enabled": true,
+  "sslRequired": "none",
+  "registrationAllowed": false,
+  "resetPasswordAllowed": false,
+  "loginWithEmailAllowed": true,
+  "roles": {
+    "realm": [
+      {
+        "name": "api-writer"
+      },
+      {
+        "name": "platform-admin"
+      },
+      {
+        "name": "clinic-admin"
+      },
+      {
+        "name": "reception"
+      },
+      {
+        "name": "professional"
+      }
+    ]
+  },
+  "clients": [
+    {
+      "clientId": "restaurant-api",
+      "enabled": true,
+      "publicClient": true,
+      "protocol": "openid-connect",
+      "standardFlowEnabled": false,
+      "directAccessGrantsEnabled": true,
+      "defaultClientScopes": [
+        "basic",
+        "profile",
+        "email",
+        "roles"
+      ],
+      "protocolMappers": [
+        {
+          "name": "api-audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": {
+            "included.client.audience": "restaurant-api",
+            "access.token.claim": "true",
+            "id.token.claim": "false"
+          }
+        }
+      ]
+    },
+    {
+      "clientId": "medicitas-provisioning",
+      "enabled": true,
+      "publicClient": false,
+      "protocol": "openid-connect",
+      "serviceAccountsEnabled": true,
+      "standardFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "secret": "${MED_ADMIN_CLIENT_SECRET}",
+      "defaultClientScopes": [
+        "basic",
+        "roles"
+      ]
+    }
+  ],
+  "users": [
+    {
+      "id": "c5e02660-d8e2-4508-9abe-0bffc21b2339",
+      "username": "escritor",
+      "enabled": true,
+      "firstName": "Usuario",
+      "lastName": "Escritor",
+      "email": "escritor@example.test",
+      "emailVerified": true,
+      "realmRoles": [
+        "api-writer"
+      ],
+      "credentials": [
+        {
+          "type": "password",
+          "value": "${K6_WRITER_PASSWORD}",
+          "temporary": false
+        }
+      ]
+    },
+    {
+      "id": "d6c243b1-7e01-4817-bbc2-10ba7b636805",
+      "username": "lector",
+      "enabled": true,
+      "firstName": "Usuario",
+      "lastName": "Lector",
+      "email": "lector@example.test",
+      "emailVerified": true,
+      "credentials": [
+        {
+          "type": "password",
+          "value": "${K6_READER_PASSWORD}",
+          "temporary": false
+        }
+      ]
+    },
+    {
+      "id": "20000000-0000-0000-0000-000000000001",
+      "username": "plataforma",
+      "enabled": true,
+      "email": "plataforma@example.test",
+      "emailVerified": true,
+      "firstName": "plataforma",
+      "lastName": "MediCitas",
+      "realmRoles": [
+        "platform-admin"
+      ],
+      "requiredActions": [],
+      "credentials": [
+        {
+          "type": "password",
+          "value": "${MED_TEST_PASSWORD}",
+          "temporary": false
+        }
+      ]
+    },
+    {
+      "id": "20000000-0000-0000-0000-000000000101",
+      "username": "admin1",
+      "enabled": true,
+      "email": "admin1@example.test",
+      "emailVerified": true,
+      "firstName": "admin1",
+      "lastName": "MediCitas",
+      "realmRoles": [
+        "clinic-admin"
+      ],
+      "requiredActions": [],
+      "credentials": [
+        {
+          "type": "password",
+          "value": "${MED_TEST_PASSWORD}",
+          "temporary": false
+        }
+      ]
+    },
+    {
+      "id": "20000000-0000-0000-0000-000000000102",
+      "username": "recepcion1",
+      "enabled": true,
+      "email": "recepcion1@example.test",
+      "emailVerified": true,
+      "firstName": "recepcion1",
+      "lastName": "MediCitas",
+      "realmRoles": [
+        "reception"
+      ],
+      "requiredActions": [],
+      "credentials": [
+        {
+          "type": "password",
+          "value": "${MED_TEST_PASSWORD}",
+          "temporary": false
+        }
+      ]
+    },
+    {
+      "id": "20000000-0000-0000-0000-000000000103",
+      "username": "profesional1",
+      "enabled": true,
+      "email": "profesional1@example.test",
+      "emailVerified": true,
+      "firstName": "profesional1",
+      "lastName": "MediCitas",
+      "realmRoles": [
+        "professional"
+      ],
+      "requiredActions": [],
+      "credentials": [
+        {
+          "type": "password",
+          "value": "${MED_TEST_PASSWORD}",
+          "temporary": false
+        }
+      ]
+    },
+    {
+      "id": "20000000-0000-0000-0000-000000000104",
+      "username": "profesional1b",
+      "enabled": true,
+      "email": "profesional1b@example.test",
+      "emailVerified": true,
+      "firstName": "profesional1b",
+      "lastName": "MediCitas",
+      "realmRoles": [
+        "professional"
+      ],
+      "requiredActions": [],
+      "credentials": [
+        {
+          "type": "password",
+          "value": "${MED_TEST_PASSWORD}",
+          "temporary": false
+        }
+      ]
+    },
+    {
+      "id": "20000000-0000-0000-0000-000000000201",
+      "username": "admin2",
+      "enabled": true,
+      "email": "admin2@example.test",
+      "emailVerified": true,
+      "firstName": "admin2",
+      "lastName": "MediCitas",
+      "realmRoles": [
+        "clinic-admin"
+      ],
+      "requiredActions": [],
+      "credentials": [
+        {
+          "type": "password",
+          "value": "${MED_TEST_PASSWORD}",
+          "temporary": false
+        }
+      ]
+    },
+    {
+      "id": "20000000-0000-0000-0000-000000000202",
+      "username": "recepcion2",
+      "enabled": true,
+      "email": "recepcion2@example.test",
+      "emailVerified": true,
+      "firstName": "recepcion2",
+      "lastName": "MediCitas",
+      "realmRoles": [
+        "reception"
+      ],
+      "requiredActions": [],
+      "credentials": [
+        {
+          "type": "password",
+          "value": "${MED_TEST_PASSWORD}",
+          "temporary": false
+        }
+      ]
+    },
+    {
+      "id": "20000000-0000-0000-0000-000000000203",
+      "username": "profesional2",
+      "enabled": true,
+      "email": "profesional2@example.test",
+      "emailVerified": true,
+      "firstName": "profesional2",
+      "lastName": "MediCitas",
+      "realmRoles": [
+        "professional"
+      ],
+      "requiredActions": [],
+      "credentials": [
+        {
+          "type": "password",
+          "value": "${MED_TEST_PASSWORD}",
+          "temporary": false
+        }
+      ]
+    },
+    {
+      "id": "20000000-0000-0000-0000-000000000204",
+      "username": "profesional2b",
+      "enabled": true,
+      "email": "profesional2b@example.test",
+      "emailVerified": true,
+      "firstName": "profesional2b",
+      "lastName": "MediCitas",
+      "realmRoles": [
+        "professional"
+      ],
+      "requiredActions": [],
+      "credentials": [
+        {
+          "type": "password",
+          "value": "${MED_TEST_PASSWORD}",
+          "temporary": false
+        }
+      ]
+    },
+    {
+      "id": "20000000-0000-0000-0000-000000000301",
+      "username": "admin3",
+      "enabled": true,
+      "email": "admin3@example.test",
+      "emailVerified": true,
+      "firstName": "admin3",
+      "lastName": "MediCitas",
+      "realmRoles": [
+        "clinic-admin"
+      ],
+      "requiredActions": [],
+      "credentials": [
+        {
+          "type": "password",
+          "value": "${MED_TEST_PASSWORD}",
+          "temporary": false
+        }
+      ]
+    },
+    {
+      "id": "20000000-0000-0000-0000-000000000302",
+      "username": "recepcion3",
+      "enabled": true,
+      "email": "recepcion3@example.test",
+      "emailVerified": true,
+      "firstName": "recepcion3",
+      "lastName": "MediCitas",
+      "realmRoles": [
+        "reception"
+      ],
+      "requiredActions": [],
+      "credentials": [
+        {
+          "type": "password",
+          "value": "${MED_TEST_PASSWORD}",
+          "temporary": false
+        }
+      ]
+    },
+    {
+      "id": "20000000-0000-0000-0000-000000000303",
+      "username": "profesional3",
+      "enabled": true,
+      "email": "profesional3@example.test",
+      "emailVerified": true,
+      "firstName": "profesional3",
+      "lastName": "MediCitas",
+      "realmRoles": [
+        "professional"
+      ],
+      "requiredActions": [],
+      "credentials": [
+        {
+          "type": "password",
+          "value": "${MED_TEST_PASSWORD}",
+          "temporary": false
+        }
+      ]
+    },
+    {
+      "id": "20000000-0000-0000-0000-000000000304",
+      "username": "profesional3b",
+      "enabled": true,
+      "email": "profesional3b@example.test",
+      "emailVerified": true,
+      "firstName": "profesional3b",
+      "lastName": "MediCitas",
+      "realmRoles": [
+        "professional"
+      ],
+      "requiredActions": [],
+      "credentials": [
+        {
+          "type": "password",
+          "value": "${MED_TEST_PASSWORD}",
+          "temporary": false
+        }
+      ]
+    },
+    {
+      "username": "service-account-medicitas-provisioning",
+      "enabled": true,
+      "serviceAccountClientId": "medicitas-provisioning",
+      "clientRoles": {
+        "realm-management": [
+          "manage-users",
+          "view-users",
+          "query-users",
+          "view-realm"
+        ]
+      }
+    }
+  ]
+}

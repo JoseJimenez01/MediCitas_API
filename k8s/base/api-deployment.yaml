@@ -1,0 +1,145 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: restaurant-api
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: restaurant-api
+  template:
+    metadata:
+      labels:
+        app: restaurant-api
+    spec:
+      containers:
+      - name: api
+        image: restaurant-api:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - name: http
+          containerPort: 8080
+        env:
+        - &id001
+          name: ASPNETCORE_URLS
+          value: http://+:8080
+        - &id002
+          name: ASPNETCORE_ENVIRONMENT
+          value: Development
+        - &id003
+          name: INITIALIZE_DATABASE
+          value: 'false'
+        - &id004
+          name: POSTGRES_HOST
+          valueFrom:
+            configMapKeyRef:
+              name: restaurant-config
+              key: POSTGRES_HOST
+        - &id005
+          name: POSTGRES_PORT
+          valueFrom:
+            configMapKeyRef:
+              name: restaurant-config
+              key: POSTGRES_PORT
+        - &id006
+          name: POSTGRES_DB
+          valueFrom:
+            configMapKeyRef:
+              name: restaurant-config
+              key: APP_DB_NAME
+        - &id007
+          name: POSTGRES_USER
+          valueFrom:
+            secretKeyRef:
+              name: restaurant-secrets
+              key: APP_DB_USER
+        - &id008
+          name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: restaurant-secrets
+              key: APP_DB_PASSWORD
+        - &id009
+          name: REDIS_CONNECTION
+          value: redis:6379
+        - &id010
+          name: KEYCLOAK_AUTHORITY
+          value: http://keycloak:8080/realms/restaurant
+        - &id011
+          name: KEYCLOAK_VALID_ISSUER
+          value: http://keycloak:8080/realms/restaurant
+        - &id012
+          name: KEYCLOAK_AUDIENCE
+          value: restaurant-api
+        - &id013
+          name: KEYCLOAK_CLIENT_ID
+          value: restaurant-api
+        - &id014
+          name: KEYCLOAK_REQUIRED_ROLE
+          value: api-writer
+        - name: MED_ADMIN_CLIENT_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: restaurant-secrets
+              key: MED_ADMIN_CLIENT_SECRET
+        startupProbe:
+          httpGet:
+            path: /health
+            port: http
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 45
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: http
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 12
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: http
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 12
+      initContainers:
+      - name: initialize-schema
+        image: restaurant-api:latest
+        imagePullPolicy: IfNotPresent
+        command:
+        - dotnet
+        - Project_Restaurant_API.dll
+        - --initialize-only
+        env:
+        - *id001
+        - *id002
+        - *id003
+        - *id004
+        - *id005
+        - *id006
+        - *id007
+        - *id008
+        - *id009
+        - *id010
+        - *id011
+        - *id012
+        - *id013
+        - *id014
+        - name: DB_BOOTSTRAP_USER
+          valueFrom:
+            secretKeyRef:
+              name: restaurant-secrets
+              key: POSTGRES_USER
+        - name: DB_BOOTSTRAP_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: restaurant-secrets
+              key: POSTGRES_PASSWORD
+      - name: wait-for-keycloak
+        image: busybox:1.37
+        command:
+        - sh
+        - -ec
+        - until wget -q -O /dev/null http://keycloak:8080/realms/restaurant/.well-known/openid-configuration;
+          do sleep 2; done

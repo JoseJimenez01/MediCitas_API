@@ -1,0 +1,75 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: k6-integration
+  namespace: restaurant-api
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: k6-integration
+    spec:
+      restartPolicy: Never
+      initContainers:
+      - name: wait-for-api
+        image: busybox:1.37
+        command:
+        - sh
+        - -c
+        - "until wget -q -O /dev/null http://restaurant-api:8080/ready; do\n  echo\
+          \ \"Esperando API...\"\n  sleep 2\ndone\n"
+      containers:
+      - name: k6
+        image: grafana/k6:0.57.0
+        args:
+        - run
+        - /scripts/integration.js
+        env:
+        - name: API_URL
+          value: http://restaurant-api:8080
+        - name: KEYCLOAK_URL
+          value: http://keycloak:8080
+        - name: KEYCLOAK_REALM
+          valueFrom:
+            configMapKeyRef:
+              name: restaurant-config
+              key: KEYCLOAK_REALM
+        - name: KEYCLOAK_CLIENT_ID
+          valueFrom:
+            configMapKeyRef:
+              name: restaurant-config
+              key: KEYCLOAK_CLIENT_ID
+        - name: RESOURCE_PATH
+          valueFrom:
+            configMapKeyRef:
+              name: restaurant-config
+              key: RESOURCE_PATH
+        - name: K6_WRITER_USERNAME
+          valueFrom:
+            secretKeyRef:
+              name: restaurant-secrets
+              key: K6_WRITER_USERNAME
+        - name: K6_WRITER_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: restaurant-secrets
+              key: K6_WRITER_PASSWORD
+        - name: K6_READER_USERNAME
+          valueFrom:
+            secretKeyRef:
+              name: restaurant-secrets
+              key: K6_READER_USERNAME
+        - name: K6_READER_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: restaurant-secrets
+              key: K6_READER_PASSWORD
+        volumeMounts:
+        - name: scripts
+          mountPath: /scripts
+          readOnly: true
+      volumes:
+      - name: scripts
+        configMap:
+          name: k6-scripts

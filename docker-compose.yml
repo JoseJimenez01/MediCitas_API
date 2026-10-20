@@ -1,0 +1,116 @@
+name: restaurant-api
+services:
+  bd:
+    image: postgres:${TAG_PG:-16-alpine}
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?}
+      POSTGRES_DB: ${POSTGRES_DB:-restaurantdb}
+    volumes:
+    - postgres_data:/var/lib/postgresql/data
+    - ./db/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test:
+      - CMD-SHELL
+      - pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"
+      interval: 5s
+      timeout: 3s
+      retries: 20
+  auth:
+    image: quay.io/keycloak/keycloak:${TAG_KC:-26.0.8}
+    command:
+    - start-dev
+    - --import-realm
+    depends_on:
+      bd:
+        condition: service_healthy
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${KC_BOOTSTRAP_ADMIN_USERNAME:?}
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KC_BOOTSTRAP_ADMIN_PASSWORD:?}
+      KC_HEALTH_ENABLED: 'true'
+      KC_METRICS_ENABLED: 'true'
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://bd:5432/keycloakdb
+      KC_DB_USERNAME: ${POSTGRES_USER}
+      KC_DB_PASSWORD: ${POSTGRES_PASSWORD}
+      KC_CACHE: local
+      KC_HTTP_ENABLED: 'true'
+      KC_HOSTNAME: http://auth:8080
+      KC_HOSTNAME_STRICT: 'false'
+      K6_WRITER_PASSWORD: ${K6_WRITER_PASSWORD:?}
+      K6_READER_PASSWORD: ${K6_READER_PASSWORD:?}
+      MED_TEST_PASSWORD: ${MED_TEST_PASSWORD:?}
+      MED_ADMIN_CLIENT_SECRET: ${MED_ADMIN_CLIENT_SECRET:?}
+    volumes:
+    - ./keycloak/realm-export.json:/opt/keycloak/data/import/realm-export.json:ro
+    ports:
+    - ${KC_PORT:-8081}:8080
+    healthcheck:
+      test:
+      - CMD
+      - bash
+      - -ec
+      - "exec 3<>/dev/tcp/127.0.0.1/9000; printf 'GET /health/ready HTTP/1.1\r\nHost:\
+        \ localhost\r\nConnection: close\r\n\r\n' >&3; grep -q 'HTTP/1.1 200' <&3"
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+  redis:
+    image: redis:7.4-alpine
+    command:
+    - redis-server
+    - --save
+    - ''
+    - --appendonly
+    - 'no'
+    healthcheck:
+      test:
+      - CMD
+      - redis-cli
+      - ping
+      interval: 5s
+      timeout: 3s
+      retries: 20
+  api:
+    build:
+      context: .
+    depends_on:
+      bd:
+        condition: service_healthy
+      auth:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      ASPNETCORE_URLS: http://+:8080
+      ASPNETCORE_ENVIRONMENT: Development
+      POSTGRES_HOST: bd
+      POSTGRES_PORT: '5432'
+      POSTGRES_DB: ${POSTGRES_DB:-restaurantdb}
+      POSTGRES_USER: ${APP_DB_USER:-medicitas_app}
+      POSTGRES_PASSWORD: ${APP_DB_PASSWORD:?}
+      DB_BOOTSTRAP_USER: ${POSTGRES_USER}
+      DB_BOOTSTRAP_PASSWORD: ${POSTGRES_PASSWORD}
+      REDIS_CONNECTION: redis:6379
+      KEYCLOAK_AUTHORITY: http://auth:8080/realms/restaurant
+      KEYCLOAK_VALID_ISSUER: http://auth:8080/realms/restaurant
+      KEYCLOAK_AUDIENCE: restaurant-api
+      KEYCLOAK_CLIENT_ID: restaurant-api
+      KEYCLOAK_REQUIRED_ROLE: api-writer
+      MED_ADMIN_CLIENT_SECRET: ${MED_ADMIN_CLIENT_SECRET:?}
+    ports:
+    - ${API_PORT:-8080}:8080
+    healthcheck:
+      test:
+      - CMD
+      - bash
+      - -ec
+      - "exec 3<>/dev/tcp/127.0.0.1/8080; printf 'GET /health HTTP/1.1\r\nHost: localhost\r\
+        \nConnection: close\r\n\r\n' >&3; grep -q 'HTTP/1.1 200' <&3"
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+volumes:
+  postgres_data: null

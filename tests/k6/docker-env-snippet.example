@@ -1,0 +1,10 @@
+# Variables que deben existir tambien en el .env real del proyecto
+# Son credenciales de PRUEBA; pueden cambiarse de ser necesario XD
+KEYCLOAK_REALM=restaurant
+KEYCLOAK_CLIENT_ID=restaurant-api
+KEYCLOAK_CLIENT_SECRET=
+K6_WRITER_USERNAME=k6_writer
+K6_WRITER_PASSWORD=CAMBIAR_WRITER_PASSWORD
+K6_READER_USERNAME=k6_reader
+K6_READER_PASSWORD=CAMBIAR_READER_PASSWORD
+RESOURCE_PATH=/reservas

@@ -1,0 +1,23 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: restaurant-config
+data:
+  ASPNETCORE_URLS: http://+:8080
+  POSTGRES_HOST: postgres
+  POSTGRES_PORT: '5432'
+  APP_DB_NAME: restaurantdb
+  KEYCLOAK_DB_NAME: keycloakdb
+  KEYCLOAK_URL: http://keycloak:8080
+  KEYCLOAK_REALM: restaurant
+  KEYCLOAK_CLIENT_ID: restaurant-api
+  KEYCLOAK_REQUIRED_ROLE: api-writer
+  RESOURCE_PATH: /reservas
+  KC_DB: postgres
+  KC_DB_URL: jdbc:postgresql://postgres:5432/keycloakdb
+  KC_CACHE: local
+  KC_HTTP_ENABLED: 'true'
+  KC_HOSTNAME_STRICT: 'false'
+  KC_HEALTH_ENABLED: 'true'
+  KC_METRICS_ENABLED: 'true'
+  KC_HTTP_MANAGEMENT_SCHEME: http

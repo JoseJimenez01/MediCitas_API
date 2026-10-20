@@ -1,0 +1,72 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: k6-persistence-create
+  namespace: restaurant-api
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      initContainers:
+      - name: wait-for-api
+        image: busybox:1.37
+        command:
+        - sh
+        - -c
+        - until wget -q -O /dev/null http://restaurant-api:8080/ready; do sleep 2;
+          done
+      containers:
+      - name: k6
+        image: grafana/k6:0.57.0
+        args:
+        - run
+        - /scripts/persistence-create.js
+        env:
+        - name: API_URL
+          value: http://restaurant-api:8080
+        - name: KEYCLOAK_URL
+          value: http://keycloak:8080
+        - name: KEYCLOAK_REALM
+          valueFrom:
+            configMapKeyRef:
+              name: restaurant-config
+              key: KEYCLOAK_REALM
+        - name: KEYCLOAK_CLIENT_ID
+          valueFrom:
+            configMapKeyRef:
+              name: restaurant-config
+              key: KEYCLOAK_CLIENT_ID
+        - name: RESOURCE_PATH
+          valueFrom:
+            configMapKeyRef:
+              name: restaurant-config
+              key: RESOURCE_PATH
+        - name: K6_WRITER_USERNAME
+          valueFrom:
+            secretKeyRef:
+              name: restaurant-secrets
+              key: K6_WRITER_USERNAME
+        - name: K6_WRITER_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: restaurant-secrets
+              key: K6_WRITER_PASSWORD
+        - name: PERSISTENCE_MARKER
+          valueFrom:
+            configMapKeyRef:
+              name: k6-persistence-config
+              key: PERSISTENCE_MARKER
+        - name: PERSISTENCE_DATE
+          valueFrom:
+            configMapKeyRef:
+              name: k6-persistence-config
+              key: PERSISTENCE_DATE
+        volumeMounts:
+        - name: scripts
+          mountPath: /scripts
+          readOnly: true
+      volumes:
+      - name: scripts
+        configMap:
+          name: k6-scripts

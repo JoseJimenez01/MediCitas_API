@@ -55,3 +55,16 @@ CodeCoverage/
 *.VisualState.xml
 TestResult.xml
 nunit-*.xml
+
+# Visual Stodio Code Folder
+/Project_Restaurant_API/.vs
+
+# Visual Studio user-specific files (local settings, no versionar)
+*.csproj.user
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# Secretos del overlay local de Kubernetes (generados por Kustomize/k8s-up.sh)
+k8s/overlays/local/secrets.env
