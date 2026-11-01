@@ -44,12 +44,12 @@ ordenan el arranque.
 
 El diseño está en PostgreSQL 15+ y se instala con un solo script: `001-schema.sql`.
 
-## Diseño de la base de datos
+**Diseño de la base de datos**
 
 El siguiente diagrama representa el diseño de la base de datos de forma visual:
 ![Diagrama de la base de datos](docs/imgs/database_diagram.png)
 
-### Estrategias de aislamiento entre clínicas
+**Estrategias de aislamiento entre clínicas**
 
 Cada clínica es un tenant y sus datos no deben ser accesibles desde otra. Hay tres formas de lograrlo:
 
@@ -59,14 +59,14 @@ Cada clínica es un tenant y sus datos no deben ser accesibles desde otra. Hay t
 
 **Se eligió la columna discriminadora**, porque el esquema por tenant puede volverse difícil de mantener cuando crece el número de clínicas.
 
-### Multi-tenancy en el schema
+**Multi-tenancy en el schema**
 
 - `clinica.id` es el tenant. Toda tabla propia de una clínica lleva `id_clinica NOT NULL` y usa PK compuesta `(id_clinica, id)`.
 - Las FK entre tablas del tenant también son compuestas, así la base impide referenciar datos de otra clínica (por ejemplo, una cita con un paciente ajeno).
 - Son globales, sin `id_clinica`: `clinica`, `rol` y `especialidad`. `usuario` tiene PK simple, porque el administrador de plataforma no pertenece a ninguna clínica (`id_clinica` nulo).
 - **Desnormalización deliberada:** `id_clinica` se repite en las tablas hijas aunque podría deducirse por JOIN. Esto rompe la 3FN a propósito, para filtrar por tenant sin subconsultas, indexar por tenant y aplicar el RLS directamente sobre cada tabla. La redundancia no puede quedar inconsistente: las FK compuestas obligan a que el `id_clinica` de la fila hija coincida con el de su padre.
 
-### Módulo adicional: RLS
+**Módulo adicional: RLS**
 
 El módulo adicional implementado es el Row-Level Security:
 
@@ -76,7 +76,7 @@ El módulo adicional implementado es el Row-Level Security:
 - La bitácora `registro_auditoria` solo admite `INSERT` y `SELECT`.
 - El aislamiento es solo por clínica; los permisos por rol dentro de una clínica los aplica el backend.
 
-### Transacciones mediante procedimientos almacenados
+**Transacciones mediante procedimientos almacenados**
 
 Todas las operaciones se realizan llamando a los procedimientos almacenados (`SP_*`), uno por cada consulta o proceso requerido (reservar, reprogramar o cancelar citas, registrar pacientes y notas, consultar la agenda, la bitácora, etc.):
 
@@ -93,7 +93,7 @@ COMMIT;
 - Los procedimientos de consulta devuelven su resultado en un cursor (`OutCursor`), que se lee con `FETCH` dentro de la misma transacción.
 - Los parámetros de entrada llevan el prefijo `In` y los de salida `Out`.
 
-### Integridad de las reglas de negocio
+**Integridad de las reglas de negocio**
 
 Las reglas críticas las garantiza la base, no solo la aplicación:
 
