@@ -1,4 +1,4 @@
-# Restaurant API — Servicio HTTP contenerizado con Docker Compose
+# MediCitas API — Servicio HTTP contenerizado con Docker Compose
 
 Servicio REST de **reservas de mesa** en **ASP.NET Core 8** con persistencia en
 **PostgreSQL**, autenticación delegada en **Keycloak** (JWT/OIDC, sin login propio) y
@@ -40,7 +40,74 @@ ordenan el arranque.
 
 ---
 
-## 2. Puesta en marcha (reproducible)
+## 2. Diseño de la base de datos
+
+El diseño está en PostgreSQL 15+ y se instala con un solo script: `001-schema.sql`.
+
+## Diseño de la base de datos
+
+El siguiente diagrama representa el diseño de la base de datos de forma visual:
+![Diagrama de la base de datos](docs/imgs/database_diagram.png)
+
+### Estrategias de aislamiento entre clínicas
+
+Cada clínica es un tenant y sus datos no deben ser accesibles desde otra. Hay tres formas de lograrlo:
+
+- **Esquema por tenant:** cada clínica tiene su propio esquema con copias de todas las tablas. Aísla bien, pero cada cambio de estructura debe replicarse en todos los esquemas, y el mantenimiento, las migraciones y el catálogo de objetos crecen con la cantidad de clínicas.
+- **Columna discriminadora:** todas las clínicas comparten las mismas tablas y cada fila lleva el `id_clinica` al que pertenece. Hay una sola estructura que mantener, sin importar cuántas clínicas existan, pero el aislamiento depende de filtrar siempre por esa columna.
+- **Row-Level Security (RLS):** mecanismo de PostgreSQL que aplica políticas por fila y obliga a la base a filtrar, aunque la consulta olvide el `WHERE`. No es una alternativa a la columna discriminadora: la refuerza.
+
+**Se eligió la columna discriminadora**, porque el esquema por tenant puede volverse difícil de mantener cuando crece el número de clínicas.
+
+### Multi-tenancy en el schema
+
+- `clinica.id` es el tenant. Toda tabla propia de una clínica lleva `id_clinica NOT NULL` y usa PK compuesta `(id_clinica, id)`.
+- Las FK entre tablas del tenant también son compuestas, así la base impide referenciar datos de otra clínica (por ejemplo, una cita con un paciente ajeno).
+- Son globales, sin `id_clinica`: `clinica`, `rol` y `especialidad`. `usuario` tiene PK simple, porque el administrador de plataforma no pertenece a ninguna clínica (`id_clinica` nulo).
+- **Desnormalización deliberada:** `id_clinica` se repite en las tablas hijas aunque podría deducirse por JOIN. Esto rompe la 3FN a propósito, para filtrar por tenant sin subconsultas, indexar por tenant y aplicar el RLS directamente sobre cada tabla. La redundancia no puede quedar inconsistente: las FK compuestas obligan a que el `id_clinica` de la fila hija coincida con el de su padre.
+
+### Módulo adicional: RLS
+
+El módulo adicional implementado es el Row-Level Security:
+
+- El backend fija el tenant al inicio de cada transacción: `SELECT set_config('app.id_clinica', '<id>', TRUE);`, tomado del token ya validado.
+- Todas las tablas con `id_clinica` (más `usuario` y `clinica`) tienen RLS activado y forzado, con una política que exige `id_clinica = app_id_clinica()` al leer y al escribir. Sin contexto definido no se ve ni se escribe ninguna fila.
+- Hay dos roles: `app_medicitas` (operación normal, sujeto a RLS) y `app_plataforma` (solo alta de clínicas y usuarios, sin acceso a datos clínicos).
+- La bitácora `registro_auditoria` solo admite `INSERT` y `SELECT`.
+- El aislamiento es solo por clínica; los permisos por rol dentro de una clínica los aplica el backend.
+
+### Transacciones mediante procedimientos almacenados
+
+Todas las operaciones se realizan llamando a los procedimientos almacenados (`SP_*`), uno por cada consulta o proceso requerido (reservar, reprogramar o cancelar citas, registrar pacientes y notas, consultar la agenda, la bitácora, etc.):
+
+- Cada SP ejecuta su lógica dentro de un bloque con manejo de errores: si algo falla, se deshace lo hecho en ese bloque, se registra el error en `db_error` y se devuelve un código en `OutResult` (0 éxito, 403, 404, 409, 422 o 500).
+- El backend abre la transacción, fija el tenant, llama al SP y hace `COMMIT`:
+
+```sql
+BEGIN;
+SELECT set_config('app.id_clinica', '42', TRUE);
+CALL SP_ReservarCita('rec01', 10, 3, 2, '2026-11-02 09:00-06', NULL, NULL);  -- (outidcita, outresult)
+COMMIT;
+```
+
+- Los procedimientos de consulta devuelven su resultado en un cursor (`OutCursor`), que se lee con `FETCH` dentro de la misma transacción.
+- Los parámetros de entrada llevan el prefijo `In` y los de salida `Out`.
+
+### Integridad de las reglas de negocio
+
+Las reglas críticas las garantiza la base, no solo la aplicación:
+
+| Regla | Mecanismo |
+|---|---|
+| Sin solapes de citas vigentes (profesional y paciente) | Restricciones `EXCLUDE` sobre el rango de tiempo; también atienden las reservas simultáneas |
+| Cita dentro del horario y fuera de bloqueos; duración fijada por el servicio; sin reservas en el pasado | Trigger en el alta de la cita |
+| Estados de la cita y reprogramación atómica | Triggers de transición; los estados finales no admiten salida |
+| Nota clínica solo de citas atendidas y del profesional que las atendió | Trigger y restricción única |
+| Bitácora append-only | Sin políticas de modificación, privilegios revocados y triggers que lo rechazan |
+
+---
+
+## 3. Puesta en marcha (reproducible)
 
 **Previo (una sola vez):**
 
@@ -110,7 +177,7 @@ curl -s -o /dev/null -w "%{http_code}\n" -X POST http://localhost:8080/reservas 
 
 ---
 
-## 3. Contrato de rutas
+## 4. Contrato de rutas
 
 ### Salud y disponibilidad (siempre abiertas, sin token)
 
@@ -156,7 +223,7 @@ mantiene operativo (`/health` sigue en `200`).
 
 ---
 
-## 4. Pruebas (unitarias + integración)
+## 5. Pruebas (unitarias + integración)
 
 Con la pila arriba (`docker compose up -d`), exportar la configuración y correr **todas**
 las pruebas con un solo comando:
@@ -231,7 +298,7 @@ Requieren las variables `K6_*` en `.env` (ver sección 7).
 
 ---
 
-## 5. Verificar la persistencia tras un reinicio
+## 6. Verificar la persistencia tras un reinicio
 
 Los datos viven en el **volumen** `postgres_data`, no en la app:
 
@@ -256,7 +323,7 @@ curl -s "http://localhost:8080/reservas?fecha=2026-12-24"
 
 ---
 
-## 6. Apagar el sistema
+## 7. Apagar el sistema
 
 ```bash
 docker compose down             # detiene y borra los contenedores, conserva el volumen
@@ -266,7 +333,7 @@ docker compose down --rmi local # además elimina las imágenes locales construi
 
 ---
 
-## 7. Configuración (variables de entorno)
+## 8. Configuración (variables de entorno)
 
 La imagen y el código **no contienen secretos**. Todo se inyecta por entorno usando
 `.env.example` como plantilla; el `.env` real está en `.gitignore` y nunca se versiona.
@@ -292,7 +359,7 @@ La cadena de conexión de la app se arma a partir de `POSTGRES_*` en `Program.cs
 
 ---
 
-## 8. Autenticación con Keycloak
+## 9. Autenticación con Keycloak
 
 - El servicio **no** implementa login ni firma de tokens; solo **valida** los JWT que
   recibe contra el proveedor (OIDC discovery + llaves públicas de Keycloak,
@@ -320,7 +387,7 @@ La cadena de conexión de la app se arma a partir de `POSTGRES_*` en `Program.cs
 
 ---
 
-## 9. Inicialización automática del esquema
+## 10. Inicialización automática del esquema
 
 Al arrancar, la API ejecuta `Database.EnsureCreatedAsync()` (`Program.cs`) con reintentos
 contra la base: si la tabla `reservas` no existe, la crea. **No hay que cargar esquemas a
@@ -330,7 +397,7 @@ esquema de Keycloak (decenas de tablas) haga que EF Core asuma que el de la app 
 
 ---
 
-## 10. Decisiones de contenerización (`Dockerfile`)
+## 11. Decisiones de contenerización (`Dockerfile`)
 
 | Decisión | Justificación |
 |---|---|
@@ -341,7 +408,7 @@ esquema de Keycloak (decenas de tablas) haga que EF Core asuma que el de la app 
 | `ENTRYPOINT ["dotnet", "Project_Restaurant_API.dll"]` | Comando de arranque del proceso publicado. |
 | Sin secretos | No hay contraseñas ni en el `Dockerfile` ni en archivos copiados: todas las credenciales llegan por variables de entorno. |
 
-## 11. Decisiones de orquestación (`docker-compose.yml`)
+## 12. Decisiones de orquestación (`docker-compose.yml`)
 
 | Decisión | Justificación |
 |---|---|
@@ -356,7 +423,7 @@ esquema de Keycloak (decenas de tablas) haga que EF Core asuma que el de la app 
 
 ---
 
-## 12. Kubernetes y Kustomize (grupos de tres)
+## 13. Kubernetes y Kustomize (grupos de tres)
 
 El mismo sistema se despliega sobre un clúster local **kind** con manifiestos en
 `k8s/` (carpeta `base/` + overlay `local/`), con Kustomize. Cada concepto de Compose tiene
@@ -395,7 +462,7 @@ versiona). La imagen se construye con el mismo `Dockerfile` del repo y se carga 
 docker build -t restaurant-api:local .   # equivalente a lo que hace k8s-up.sh
 ```
 
-## 13. Estructura del repositorio
+## 14. Estructura del repositorio
 
 ```
 .
@@ -423,7 +490,7 @@ docker build -t restaurant-api:local .   # equivalente a lo que hace k8s-up.sh
 └── Project_Restaurant_API.Tests/              # 20 unitarias + 8 de integración
 ```
 
-## 14. Declaración de uso de IA
+## 15. Declaración de uso de IA
 
 ##### [Josimar Araya]()
 
