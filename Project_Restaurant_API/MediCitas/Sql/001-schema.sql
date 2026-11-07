@@ -10,10 +10,16 @@
 CREATE EXTENSION IF NOT EXISTS btree_gist;
 
 -- ---------------------------------------------------------------------
--- 0. ROLES
---    app_medicitas : rol de la aplicacion (sujeto a RLS por tenant)
---    app_plataforma: administrador de plataforma (solo clinica y usuario;
---                    sin ningun permiso sobre datos clinicos)
+-- 0. ROLES (menor privilegio alineado con la matriz de permisos)
+--    app_medicitas     : rol base de clinica (sujeto a las politicas RLS por tenant)
+--    app_plataforma    : administrador de plataforma (solo clinica y usuario;
+--                        sin ningun permiso sobre datos clinicos)
+--    app_admin_clinica : administrador de clinica (catalogos, usuarios, agenda,
+--                        citas, pacientes y lectura de bitacora; sin notas clinicas)
+--    app_recepcion     : recepcion (pacientes, agenda y ciclo de citas; sin bitacora
+--                        ni notas clinicas ni administracion de usuarios/servicios)
+--    app_profesional   : profesional de salud (horarios/bloqueos propios, desenlace,
+--                        lectura de pacientes/historial y exclusivo en notas clinicas)
 --    Los usuarios de conexion se crean aparte y se agregan con GRANT.
 -- ---------------------------------------------------------------------
 DO $$
@@ -24,8 +30,19 @@ BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'app_plataforma') THEN
         CREATE ROLE app_plataforma NOLOGIN;
     END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'app_admin_clinica') THEN
+        CREATE ROLE app_admin_clinica NOLOGIN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'app_recepcion') THEN
+        CREATE ROLE app_recepcion NOLOGIN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'app_profesional') THEN
+        CREATE ROLE app_profesional NOLOGIN;
+    END IF;
 END
 $$;
+
+GRANT app_medicitas TO app_admin_clinica, app_recepcion, app_profesional;
 
 -- ---------------------------------------------------------------------
 -- 1. TIPOS ENUM
@@ -626,27 +643,40 @@ CREATE POLICY pol_plataforma ON clinica FOR ALL TO app_plataforma
     USING (TRUE) WITH CHECK (TRUE);
 
 -- =====================================================================
--- 11. PRIVILEGIOS
+-- 11. PRIVILEGIOS (menor privilegio por perfil alineado con la matriz)
 -- =====================================================================
-GRANT USAGE ON SCHEMA public TO app_medicitas, app_plataforma;
+GRANT USAGE ON SCHEMA public TO app_medicitas, app_plataforma, app_admin_clinica, app_recepcion, app_profesional;
 
--- Catalogos globales (solo lectura)
+-- Catalogos globales
 GRANT SELECT ON rol, especialidad TO app_medicitas, app_plataforma;
+GRANT INSERT ON especialidad TO app_admin_clinica;
 
 -- Plataforma: unicamente clinica y usuario (ningun dato clinico)
 GRANT SELECT, INSERT, UPDATE ON clinica, usuario TO app_plataforma;
 
--- Aplicacion
+-- Permisos comunes de clinica (heredados de app_medicitas)
 GRANT SELECT ON clinica TO app_medicitas;
-GRANT SELECT, INSERT, UPDATE ON usuario, servicio, profesional, paciente, cita TO app_medicitas;
-GRANT SELECT, INSERT ON nota_clinica, registro_auditoria TO app_medicitas;
-GRANT SELECT, INSERT, UPDATE, DELETE ON profesional_x_servicio, horario_atencion, bloqueo_agenda TO app_medicitas;
+GRANT INSERT ON registro_auditoria, db_error TO app_medicitas, app_plataforma;
+
+-- Perfil Administrador de Clinica: gestiona usuarios, servicios, profesionales, horarios, bloqueos,
+-- pacientes, citas y es el UNICO con SELECT en registro_auditoria (sin acceso a nota_clinica)
+GRANT SELECT, INSERT, UPDATE ON usuario, servicio, profesional, paciente, cita TO app_admin_clinica;
+GRANT SELECT, INSERT, UPDATE, DELETE ON profesional_x_servicio, horario_atencion, bloqueo_agenda TO app_admin_clinica;
+GRANT SELECT ON registro_auditoria TO app_admin_clinica;
+
+-- Perfil Recepcion: opera pacientes y citas, lee catalogos/agenda (sin SELECT en registro_auditoria ni nota_clinica)
+GRANT SELECT ON usuario, servicio, profesional, profesional_x_servicio, horario_atencion, bloqueo_agenda TO app_recepcion;
+GRANT SELECT, INSERT, UPDATE ON paciente, cita TO app_recepcion;
+
+-- Perfil Profesional: lectura de pacientes/catalogos, propios horarios/bloqueos, desenlace en cita
+-- y UNICO con SELECT e INSERT en nota_clinica (sin SELECT en registro_auditoria)
+GRANT SELECT ON usuario, servicio, profesional, profesional_x_servicio, paciente TO app_profesional;
+GRANT SELECT, UPDATE ON cita TO app_profesional;
+GRANT SELECT, INSERT, UPDATE, DELETE ON horario_atencion, bloqueo_agenda TO app_profesional;
+GRANT SELECT, INSERT ON nota_clinica TO app_profesional;
 
 -- I6: refuerzo a nivel de privilegios (ademas del trigger y de RLS)
-REVOKE UPDATE, DELETE, TRUNCATE ON registro_auditoria FROM app_medicitas, app_plataforma;
-
--- Bitacora de errores: la aplicacion solo inserta
-GRANT INSERT ON db_error TO app_medicitas, app_plataforma;
+REVOKE UPDATE, DELETE, TRUNCATE ON registro_auditoria FROM app_medicitas, app_plataforma, app_admin_clinica, app_recepcion, app_profesional;
 
 -- =====================================================================
 -- 12. PROCEDIMIENTOS ALMACENADOS
@@ -851,7 +881,15 @@ BEGIN
     -- Equivalente a BEGIN TRANSACTION: el bloque con EXCEPTION abre un savepoint implicito
     -- (el COMMIT lo hace la transaccion del backend, para conservar el contexto del tenant)
     BEGIN
-        UPDATE usuario SET id_rol = InIdRol
+        IF InIdRol <> 4 AND EXISTS (
+            SELECT 1 FROM profesional p
+            WHERE p.id_clinica = app_id_clinica() AND p.id_usuario = InIdUsuario
+        ) THEN
+            RAISE EXCEPTION 'El usuario % tiene un profesional asociado', InIdUsuario
+                USING ERRCODE = 'unique_violation';
+        END IF;
+
+        UPDATE usuario SET id_rol = InIdRol, activo = TRUE
         WHERE id_clinica = app_id_clinica() AND id = InIdUsuario;
         IF NOT FOUND THEN
             OutResult := 404;
@@ -1451,6 +1489,15 @@ BEGIN
     -- Equivalente a BEGIN TRANSACTION: el bloque con EXCEPTION abre un savepoint implicito
     -- (el COMMIT lo hace la transaccion del backend, para conservar el contexto del tenant)
     BEGIN
+        IF EXISTS (
+            SELECT 1 FROM horario_atencion h
+            JOIN cita c ON c.id_clinica = h.id_clinica AND c.id_profesional = h.id_profesional
+            WHERE h.id_clinica = app_id_clinica() AND h.id = InIdHorario AND c.estado = 'reservada'
+        ) THEN
+            RAISE EXCEPTION 'Reprograme las citas vigentes antes de retirar horarios'
+                USING ERRCODE = 'exclusion_violation';
+        END IF;
+
         DELETE FROM horario_atencion
         WHERE id_clinica = app_id_clinica() AND id = InIdHorario;
         IF NOT FOUND THEN
@@ -2464,7 +2511,7 @@ BEGIN
             SELECT p.id, p.identificacion, p.nombre, p.fecha_nacimiento
             FROM paciente p
             WHERE p.id_clinica = app_id_clinica()
-              AND (p.identificacion = InTexto OR p.nombre ILIKE '%' || InTexto || '%')
+              AND (InTexto IS NULL OR InTexto = '' OR p.identificacion = InTexto OR p.nombre ILIKE '%' || InTexto || '%')
             ORDER BY p.nombre
             LIMIT 50;
     EXCEPTION
@@ -3072,36 +3119,415 @@ BEGIN
 END;
 $$;
 
+-- RF17 - Resolver identidad del proveedor externo por token_sub
+CREATE OR REPLACE PROCEDURE SP_ResolverIdentidad(
+      InTokenSub VARCHAR(128)
+    , OUT OutIdUsuario INT
+    , OUT OutIdClinica INT
+    , OUT OutIdRol INT
+    , OUT OutNombreUsuario VARCHAR(128)
+    , OUT OutCorreo VARCHAR(32)
+    , OUT OutActivo BOOLEAN
+    , OUT OutIdProfesional INT
+    , OUT OutResult INT
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+BEGIN
+    OutResult := 0;
+
+    SELECT u.id, u.id_clinica, u.id_rol, u.nombre_usuario, u.correo, u.activo
+    INTO OutIdUsuario, OutIdClinica, OutIdRol, OutNombreUsuario, OutCorreo, OutActivo
+    FROM usuario u
+    WHERE u.token_sub = InTokenSub;
+
+    IF NOT FOUND THEN
+        OutResult := 403;
+        RETURN;
+    END IF;
+
+    IF OutIdClinica IS NOT NULL THEN
+        PERFORM set_config('app.id_clinica', OutIdClinica::TEXT, TRUE);
+        SELECT p.id INTO OutIdProfesional
+        FROM profesional p
+        WHERE p.id_clinica = OutIdClinica AND p.id_usuario = OutIdUsuario;
+    END IF;
+END;
+$$;
+
+-- Auxiliar RF3 / RF4 - Resolver o crear especialidad en el catalogo global
+CREATE OR REPLACE PROCEDURE SP_ResolverEspecialidad(
+      InUserName VARCHAR(100)
+    , InNombre VARCHAR(32)
+    , OUT OutIdEspecialidad INT
+    , OUT OutResult INT
+)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    vSqlState TEXT;
+    vMessage  TEXT;
+    vContext  TEXT;
+BEGIN
+    OutResult := 0;
+
+    BEGIN
+        SELECT e.id INTO OutIdEspecialidad
+        FROM especialidad e
+        WHERE LOWER(e.nombre) = LOWER(TRIM(InNombre));
+
+        IF NOT FOUND THEN
+            INSERT INTO especialidad (nombre, descripcion)
+            VALUES (LEFT(TRIM(InNombre), 32), LEFT(TRIM(InNombre), 64))
+            RETURNING id INTO OutIdEspecialidad;
+        END IF;
+    EXCEPTION
+        WHEN OTHERS THEN
+            GET STACKED DIAGNOSTICS
+                vSqlState = RETURNED_SQLSTATE,
+                vMessage  = MESSAGE_TEXT,
+                vContext  = PG_EXCEPTION_CONTEXT;
+            OutResult := CASE
+                WHEN vSqlState IN ('23P01', '23505', '40001', '40P01') THEN 409
+                WHEN vSqlState IN ('23514', '23503', '23502') OR vSqlState LIKE '22%' THEN 422
+                WHEN vSqlState = '42501' THEN 403
+                WHEN vSqlState = 'P0002' THEN 404
+                ELSE 500
+            END;
+            OutIdEspecialidad := NULL;
+            INSERT INTO db_error (user_name, error_number, error_state, error_severity, error_line, error_procedure, error_message, error_datetime)
+            VALUES (InUserName, OutResult, vSqlState, 'ERROR', NULLIF(SUBSTRING(vContext FROM 'line ([0-9]+)'), '')::INT, 'SP_ResolverEspecialidad', vMessage, now());
+    END;
+END;
+$$;
+
+-- RF7 - Calcular espacios disponibles de un profesional en una fecha (en caso de cache miss en Redis)
+CREATE OR REPLACE PROCEDURE SP_ConsultarDisponibilidadProfesional(
+      InUserName VARCHAR(100)
+    , InIdProfesional INT
+    , InIdServicio INT
+    , InFecha DATE
+    , OUT OutCursor REFCURSOR
+    , OUT OutResult INT
+)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    vSqlState TEXT;
+    vMessage  TEXT;
+    vContext  TEXT;
+    vDuracion INT;
+    vZona VARCHAR(32);
+BEGIN
+    OutResult := 0;
+
+    IF app_id_clinica() IS NULL THEN
+        OutResult := 403;
+        RETURN;
+    END IF;
+
+    BEGIN
+        IF InFecha IS NULL THEN
+            OutResult := 422;
+            RETURN;
+        END IF;
+
+        SELECT s.duracion_min, c.zona_horaria
+        INTO vDuracion, vZona
+        FROM servicio s
+        JOIN clinica c ON c.id = s.id_clinica
+        JOIN profesional_x_servicio x ON x.id_clinica = s.id_clinica AND x.id_servicio = s.id
+        JOIN profesional p ON p.id_clinica = x.id_clinica AND p.id = x.id_profesional
+        JOIN usuario u ON u.id_clinica = p.id_clinica AND u.id = p.id_usuario
+        WHERE s.id_clinica = app_id_clinica()
+          AND s.id = InIdServicio
+          AND p.id = InIdProfesional
+          AND u.activo;
+
+        IF NOT FOUND THEN
+            OutResult := 404;
+            RETURN;
+        END IF;
+
+        OPEN OutCursor FOR
+            WITH espacios AS (
+                SELECT (InFecha + g.t) AT TIME ZONE vZona AS hora_inicio,
+                       ((InFecha + g.t) AT TIME ZONE vZona) + make_interval(mins => vDuracion) AS hora_fin
+                FROM horario_atencion h
+                CROSS JOIN LATERAL generate_series(
+                    h.hora_inicio,
+                    h.hora_fin - make_interval(mins => vDuracion),
+                    make_interval(mins => vDuracion)) AS g(t)
+                WHERE h.id_clinica = app_id_clinica()
+                  AND h.id_profesional = InIdProfesional
+                  AND h.dia = EXTRACT(ISODOW FROM InFecha)::INT
+            )
+            SELECT e.hora_inicio, e.hora_fin
+            FROM espacios e
+            WHERE e.hora_inicio > now()
+              AND NOT EXISTS (
+                  SELECT 1 FROM cita c
+                  WHERE c.id_clinica = app_id_clinica()
+                    AND c.id_profesional = InIdProfesional
+                    AND c.estado IN ('reservada', 'atendida')
+                    AND tstzrange(c.hora_inicio, c.hora_fin) && tstzrange(e.hora_inicio, e.hora_fin))
+              AND NOT EXISTS (
+                  SELECT 1 FROM bloqueo_agenda b
+                  WHERE b.id_clinica = app_id_clinica()
+                    AND b.id_profesional = InIdProfesional
+                    AND (b.id_servicio IS NULL OR b.id_servicio = InIdServicio)
+                    AND tstzrange(b.hora_inicio, b.hora_fin) && tstzrange(e.hora_inicio, e.hora_fin))
+            ORDER BY e.hora_inicio;
+    EXCEPTION
+        WHEN OTHERS THEN
+            GET STACKED DIAGNOSTICS
+                vSqlState = RETURNED_SQLSTATE,
+                vMessage  = MESSAGE_TEXT,
+                vContext  = PG_EXCEPTION_CONTEXT;
+            OutResult := CASE
+                WHEN vSqlState IN ('23P01', '23505', '40001', '40P01') THEN 409
+                WHEN vSqlState IN ('23514', '23503', '23502') OR vSqlState LIKE '22%' THEN 422
+                WHEN vSqlState = '42501' THEN 403
+                WHEN vSqlState = 'P0002' THEN 404
+                ELSE 500
+            END;
+            OutCursor := NULL;
+            INSERT INTO db_error (user_name, error_number, error_state, error_severity, error_line, error_procedure, error_message, error_datetime)
+            VALUES (InUserName, OutResult, vSqlState, 'ERROR', NULLIF(SUBSTRING(vContext FROM 'line ([0-9]+)'), '')::INT, 'SP_ConsultarDisponibilidadProfesional', vMessage, now());
+    END;
+END;
+$$;
+
+-- RF2 - Listar usuarios de la clinica (cursor)
+CREATE OR REPLACE PROCEDURE SP_ListarUsuarios(
+      InUserName VARCHAR(100)
+    , OUT OutCursor REFCURSOR
+    , OUT OutResult INT
+)
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    OutResult := 0;
+    IF app_id_clinica() IS NULL THEN
+        OutResult := 403;
+        RETURN;
+    END IF;
+    OPEN OutCursor FOR
+        SELECT u.id, u.id_clinica, u.id_rol, r.nombre AS rol_nombre, u.nombre_usuario, u.correo, u.token_sub, u.activo
+        FROM usuario u
+        JOIN rol r ON r.id = u.id_rol
+        WHERE u.id_clinica = app_id_clinica()
+        ORDER BY u.id;
+END;
+$$;
+
+-- RF3 - Listar servicios del catalogo de la clinica (cursor)
+CREATE OR REPLACE PROCEDURE SP_ListarServicios(
+      InUserName VARCHAR(100)
+    , OUT OutCursor REFCURSOR
+    , OUT OutResult INT
+)
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    OutResult := 0;
+    IF app_id_clinica() IS NULL THEN
+        OutResult := 403;
+        RETURN;
+    END IF;
+    OPEN OutCursor FOR
+        SELECT s.id, s.id_clinica, s.id_especialidad, e.nombre AS especialidad, s.nombre, s.duracion_min
+        FROM servicio s
+        JOIN especialidad e ON e.id = s.id_especialidad
+        WHERE s.id_clinica = app_id_clinica()
+        ORDER BY s.id;
+END;
+$$;
+
+-- RF4 - Listar profesionales de la clinica (cursor)
+CREATE OR REPLACE PROCEDURE SP_ListarProfesionales(
+      InUserName VARCHAR(100)
+    , OUT OutCursor REFCURSOR
+    , OUT OutResult INT
+)
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    OutResult := 0;
+    IF app_id_clinica() IS NULL THEN
+        OutResult := 403;
+        RETURN;
+    END IF;
+    OPEN OutCursor FOR
+        SELECT p.id, p.id_clinica, p.id_usuario, u.nombre_usuario AS nombre, p.id_especialidad, e.nombre AS especialidad, u.activo
+        FROM profesional p
+        JOIN usuario u ON u.id_clinica = p.id_clinica AND u.id = p.id_usuario
+        JOIN especialidad e ON e.id = p.id_especialidad
+        WHERE p.id_clinica = app_id_clinica()
+        ORDER BY p.id;
+END;
+$$;
+
+-- RF5 - Listar horarios semanales de un profesional (cursor)
+CREATE OR REPLACE PROCEDURE SP_ListarHorariosProfesional(
+      InUserName VARCHAR(100)
+    , InIdProfesional INT
+    , OUT OutCursor REFCURSOR
+    , OUT OutResult INT
+)
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    OutResult := 0;
+    IF app_id_clinica() IS NULL THEN
+        OutResult := 403;
+        RETURN;
+    END IF;
+    OPEN OutCursor FOR
+        SELECT h.id, h.id_clinica, h.id_profesional, h.dia, h.hora_inicio, h.hora_fin
+        FROM horario_atencion h
+        WHERE h.id_clinica = app_id_clinica() AND h.id_profesional = InIdProfesional
+        ORDER BY h.dia, h.hora_inicio;
+END;
+$$;
+
+-- RF6 - Listar bloqueos de agenda de un profesional (cursor)
+CREATE OR REPLACE PROCEDURE SP_ListarBloqueosProfesional(
+      InUserName VARCHAR(100)
+    , InIdProfesional INT
+    , OUT OutCursor REFCURSOR
+    , OUT OutResult INT
+)
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    OutResult := 0;
+    IF app_id_clinica() IS NULL THEN
+        OutResult := 403;
+        RETURN;
+    END IF;
+    OPEN OutCursor FOR
+        SELECT b.id, b.id_clinica, b.id_profesional, b.id_servicio, b.id_usuario, b.hora_inicio, b.hora_fin, b.motivo
+        FROM bloqueo_agenda b
+        WHERE b.id_clinica = app_id_clinica() AND b.id_profesional = InIdProfesional
+        ORDER BY b.hora_inicio;
+END;
+$$;
+
+-- RF6 - Eliminar un bloqueo de agenda
+CREATE OR REPLACE PROCEDURE SP_EliminarBloqueoAgenda(
+      InUserName VARCHAR(100)
+    , InIdBloqueo INT
+    , OUT OutIdProfesional INT
+    , OUT OutResult INT
+)
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    OutResult := 0;
+    IF app_id_clinica() IS NULL THEN
+        OutResult := 403;
+        RETURN;
+    END IF;
+    DELETE FROM bloqueo_agenda
+    WHERE id_clinica = app_id_clinica() AND id = InIdBloqueo
+    RETURNING id_profesional INTO OutIdProfesional;
+    IF NOT FOUND THEN
+        OutResult := 404;
+    END IF;
+END;
+$$;
+
+-- RF9..RF13 - Consultar una cita por identificador (cursor)
+CREATE OR REPLACE PROCEDURE SP_ConsultarCita(
+      InUserName VARCHAR(100)
+    , InIdCita INT
+    , OUT OutCursor REFCURSOR
+    , OUT OutResult INT
+)
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    OutResult := 0;
+    IF app_id_clinica() IS NULL THEN
+        OutResult := 403;
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM cita c WHERE c.id_clinica = app_id_clinica() AND c.id = InIdCita) THEN
+        OutResult := 404;
+        RETURN;
+    END IF;
+    OPEN OutCursor FOR
+        SELECT c.id, c.id_clinica, c.id_cita_origen, c.id_paciente, c.id_profesional, c.id_servicio,
+               c.id_usuario_cancelo, c.creada, c.estado, c.hora_inicio, c.hora_fin, c.motivo_cancelada
+        FROM cita c
+        WHERE c.id_clinica = app_id_clinica() AND c.id = InIdCita;
+END;
+$$;
+
 -- ---------------------------------------------------------------------
 -- Privilegios de ejecucion: cada rol solo ejecuta sus procedimientos
 -- ---------------------------------------------------------------------
 REVOKE ALL ON ALL PROCEDURES IN SCHEMA public FROM PUBLIC;
 
+-- Identidad (todos los perfiles autenticados)
+GRANT EXECUTE ON PROCEDURE SP_ResolverIdentidad(VARCHAR(128)) TO app_plataforma, app_medicitas, app_admin_clinica, app_recepcion, app_profesional;
+
+-- Plataforma (RF1)
 GRANT EXECUTE ON PROCEDURE SP_AltaClinica(VARCHAR(100), VARCHAR(32), VARCHAR(32), VARCHAR(32), VARCHAR(128), VARCHAR(32), VARCHAR(128)) TO app_plataforma;
-GRANT EXECUTE ON PROCEDURE SP_CrearUsuario(VARCHAR(100), VARCHAR(128), VARCHAR(32), VARCHAR(128), INT) TO app_medicitas;
-GRANT EXECUTE ON PROCEDURE SP_CambiarRolUsuario(VARCHAR(100), INT, INT) TO app_medicitas;
-GRANT EXECUTE ON PROCEDURE SP_DarBajaUsuario(VARCHAR(100), INT) TO app_medicitas;
-GRANT EXECUTE ON PROCEDURE SP_CrearServicio(VARCHAR(100), VARCHAR(16), INT, INT) TO app_medicitas;
-GRANT EXECUTE ON PROCEDURE SP_ActualizarServicio(VARCHAR(100), INT, VARCHAR(16), INT, INT) TO app_medicitas;
-GRANT EXECUTE ON PROCEDURE SP_CrearProfesional(VARCHAR(100), INT, INT) TO app_medicitas;
-GRANT EXECUTE ON PROCEDURE SP_AsignarServicioProfesional(VARCHAR(100), INT, INT) TO app_medicitas;
-GRANT EXECUTE ON PROCEDURE SP_QuitarServicioProfesional(VARCHAR(100), INT, INT) TO app_medicitas;
-GRANT EXECUTE ON PROCEDURE SP_AgregarHorarioAtencion(VARCHAR(100), INT, INT, TIME, TIME) TO app_medicitas;
-GRANT EXECUTE ON PROCEDURE SP_EliminarHorarioAtencion(VARCHAR(100), INT) TO app_medicitas;
-GRANT EXECUTE ON PROCEDURE SP_RegistrarBloqueoAgenda(VARCHAR(100), INT, INT, INT, TIMESTAMPTZ, TIMESTAMPTZ, VARCHAR(16)) TO app_medicitas;
-GRANT EXECUTE ON PROCEDURE SP_ListarConflictosBloqueo(VARCHAR(100), INT) TO app_medicitas;
-GRANT EXECUTE ON PROCEDURE SP_ConsultarDisponibilidadServicio(VARCHAR(100), INT, DATE, DATE) TO app_medicitas;
-GRANT EXECUTE ON PROCEDURE SP_ReservarCita(VARCHAR(100), INT, INT, INT, TIMESTAMPTZ) TO app_medicitas;
-GRANT EXECUTE ON PROCEDURE SP_ReprogramarCita(VARCHAR(100), INT, TIMESTAMPTZ, INT) TO app_medicitas;
-GRANT EXECUTE ON PROCEDURE SP_CancelarCita(VARCHAR(100), INT, VARCHAR(64), INT) TO app_medicitas;
-GRANT EXECUTE ON PROCEDURE SP_RegistrarDesenlaceCita(VARCHAR(100), INT, VARCHAR(16)) TO app_medicitas;
-GRANT EXECUTE ON PROCEDURE SP_CrearPaciente(VARCHAR(100), INT, INET, VARCHAR(16), VARCHAR(32), DATE, VARCHAR(20), VARCHAR(32)) TO app_medicitas;
-GRANT EXECUTE ON PROCEDURE SP_ActualizarPaciente(VARCHAR(100), INT, INET, INT, VARCHAR(16), VARCHAR(32), DATE, VARCHAR(20), VARCHAR(32)) TO app_medicitas;
-GRANT EXECUTE ON PROCEDURE SP_ConsultarPaciente(VARCHAR(100), INT, INET, INT) TO app_medicitas;
-GRANT EXECUTE ON PROCEDURE SP_BuscarPacientes(VARCHAR(100), VARCHAR(32)) TO app_medicitas;
-GRANT EXECUTE ON PROCEDURE SP_CrearNotaClinica(VARCHAR(100), INT, INET, INT, TEXT) TO app_medicitas;
-GRANT EXECUTE ON PROCEDURE SP_ConsultarNotaClinica(VARCHAR(100), INT, INET, INT) TO app_medicitas;
-GRANT EXECUTE ON PROCEDURE SP_ConsultarHistorialPaciente(VARCHAR(100), INT) TO app_medicitas;
-GRANT EXECUTE ON PROCEDURE SP_ConsultarAuditoria(VARCHAR(100), INT, INT, TIMESTAMPTZ, TIMESTAMPTZ) TO app_medicitas;
-GRANT EXECUTE ON PROCEDURE SP_ConsultarAgendaDia(VARCHAR(100), DATE, INT) TO app_medicitas;
-GRANT EXECUTE ON PROCEDURE SP_ContarCitasPorEstado(VARCHAR(100), DATE, DATE) TO app_medicitas;
+
+-- Administracion de clinica: usuarios, servicios y profesionales (RF2 a RF4)
+GRANT EXECUTE ON PROCEDURE SP_CrearUsuario(VARCHAR(100), VARCHAR(128), VARCHAR(32), VARCHAR(128), INT) TO app_admin_clinica;
+GRANT EXECUTE ON PROCEDURE SP_CambiarRolUsuario(VARCHAR(100), INT, INT) TO app_admin_clinica;
+GRANT EXECUTE ON PROCEDURE SP_DarBajaUsuario(VARCHAR(100), INT) TO app_admin_clinica;
+GRANT EXECUTE ON PROCEDURE SP_ListarUsuarios(VARCHAR(100)) TO app_admin_clinica;
+GRANT EXECUTE ON PROCEDURE SP_ResolverEspecialidad(VARCHAR(100), VARCHAR(32)) TO app_admin_clinica;
+GRANT EXECUTE ON PROCEDURE SP_CrearServicio(VARCHAR(100), VARCHAR(16), INT, INT) TO app_admin_clinica;
+GRANT EXECUTE ON PROCEDURE SP_ActualizarServicio(VARCHAR(100), INT, VARCHAR(16), INT, INT) TO app_admin_clinica;
+GRANT EXECUTE ON PROCEDURE SP_ListarServicios(VARCHAR(100)) TO app_admin_clinica, app_recepcion, app_profesional;
+GRANT EXECUTE ON PROCEDURE SP_CrearProfesional(VARCHAR(100), INT, INT) TO app_admin_clinica;
+GRANT EXECUTE ON PROCEDURE SP_AsignarServicioProfesional(VARCHAR(100), INT, INT) TO app_admin_clinica;
+GRANT EXECUTE ON PROCEDURE SP_QuitarServicioProfesional(VARCHAR(100), INT, INT) TO app_admin_clinica;
+GRANT EXECUTE ON PROCEDURE SP_ListarProfesionales(VARCHAR(100)) TO app_admin_clinica, app_recepcion, app_profesional;
+
+-- Horarios y bloqueos (RF5, RF6): admin de clinica y profesional
+GRANT EXECUTE ON PROCEDURE SP_AgregarHorarioAtencion(VARCHAR(100), INT, INT, TIME, TIME) TO app_admin_clinica, app_profesional;
+GRANT EXECUTE ON PROCEDURE SP_EliminarHorarioAtencion(VARCHAR(100), INT) TO app_admin_clinica, app_profesional;
+GRANT EXECUTE ON PROCEDURE SP_ListarHorariosProfesional(VARCHAR(100), INT) TO app_admin_clinica, app_recepcion, app_profesional;
+GRANT EXECUTE ON PROCEDURE SP_RegistrarBloqueoAgenda(VARCHAR(100), INT, INT, INT, TIMESTAMPTZ, TIMESTAMPTZ, VARCHAR(16)) TO app_admin_clinica, app_profesional;
+GRANT EXECUTE ON PROCEDURE SP_ListarConflictosBloqueo(VARCHAR(100), INT) TO app_admin_clinica, app_recepcion, app_profesional;
+GRANT EXECUTE ON PROCEDURE SP_ListarBloqueosProfesional(VARCHAR(100), INT) TO app_admin_clinica, app_recepcion, app_profesional;
+GRANT EXECUTE ON PROCEDURE SP_EliminarBloqueoAgenda(VARCHAR(100), INT) TO app_admin_clinica, app_profesional;
+
+-- Disponibilidad (RF7, RF8): admin de clinica, recepcion y profesional
+GRANT EXECUTE ON PROCEDURE SP_ConsultarDisponibilidadProfesional(VARCHAR(100), INT, INT, DATE) TO app_admin_clinica, app_recepcion, app_profesional;
+GRANT EXECUTE ON PROCEDURE SP_ConsultarDisponibilidadServicio(VARCHAR(100), INT, DATE, DATE) TO app_admin_clinica, app_recepcion, app_profesional;
+
+-- Reservar, reprogramar y cancelar citas (RF9 a RF11): admin de clinica y recepcion
+GRANT EXECUTE ON PROCEDURE SP_ReservarCita(VARCHAR(100), INT, INT, INT, TIMESTAMPTZ) TO app_admin_clinica, app_recepcion;
+GRANT EXECUTE ON PROCEDURE SP_ReprogramarCita(VARCHAR(100), INT, TIMESTAMPTZ, INT) TO app_admin_clinica, app_recepcion;
+GRANT EXECUTE ON PROCEDURE SP_CancelarCita(VARCHAR(100), INT, VARCHAR(64), INT) TO app_admin_clinica, app_recepcion;
+
+-- Desenlace y consulta de cita (RF12, RF13): admin de clinica, recepcion y profesional
+GRANT EXECUTE ON PROCEDURE SP_RegistrarDesenlaceCita(VARCHAR(100), INT, VARCHAR(16)) TO app_admin_clinica, app_recepcion, app_profesional;
+GRANT EXECUTE ON PROCEDURE SP_ConsultarCita(VARCHAR(100), INT) TO app_admin_clinica, app_recepcion, app_profesional;
+
+-- Pacientes e historial (RF14, RF16): escritura solo admin y recepcion; lectura/historial tambien profesional
+GRANT EXECUTE ON PROCEDURE SP_CrearPaciente(VARCHAR(100), INT, INET, VARCHAR(16), VARCHAR(32), DATE, VARCHAR(20), VARCHAR(32)) TO app_admin_clinica, app_recepcion;
+GRANT EXECUTE ON PROCEDURE SP_ActualizarPaciente(VARCHAR(100), INT, INET, INT, VARCHAR(16), VARCHAR(32), DATE, VARCHAR(20), VARCHAR(32)) TO app_admin_clinica, app_recepcion;
+GRANT EXECUTE ON PROCEDURE SP_ConsultarPaciente(VARCHAR(100), INT, INET, INT) TO app_admin_clinica, app_recepcion, app_profesional;
+GRANT EXECUTE ON PROCEDURE SP_BuscarPacientes(VARCHAR(100), VARCHAR(32)) TO app_admin_clinica, app_recepcion, app_profesional;
+GRANT EXECUTE ON PROCEDURE SP_ConsultarHistorialPaciente(VARCHAR(100), INT) TO app_admin_clinica, app_recepcion, app_profesional;
+
+-- Notas clinicas (RF15): EXCLUSIVO del profesional
+GRANT EXECUTE ON PROCEDURE SP_CrearNotaClinica(VARCHAR(100), INT, INET, INT, TEXT) TO app_profesional;
+GRANT EXECUTE ON PROCEDURE SP_ConsultarNotaClinica(VARCHAR(100), INT, INET, INT) TO app_profesional;
+
+-- Bitacora de auditoria (RF19): EXCLUSIVO del administrador de clinica
+GRANT EXECUTE ON PROCEDURE SP_ConsultarAuditoria(VARCHAR(100), INT, INT, TIMESTAMPTZ, TIMESTAMPTZ) TO app_admin_clinica;
+
+-- Agenda y estadisticas (RF20, RF21)
+GRANT EXECUTE ON PROCEDURE SP_ConsultarAgendaDia(VARCHAR(100), DATE, INT) TO app_admin_clinica, app_recepcion, app_profesional;
+GRANT EXECUTE ON PROCEDURE SP_ContarCitasPorEstado(VARCHAR(100), DATE, DATE) TO app_admin_clinica, app_recepcion;

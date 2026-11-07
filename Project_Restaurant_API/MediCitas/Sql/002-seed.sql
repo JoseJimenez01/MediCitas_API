@@ -47,8 +47,6 @@
 --  15. Incidente 2026-08-12 14:00-16:00: rafaga de deadlocks y timeouts en reservas.
 --  16. Algunos servicios con demanda desbalanceada (65% / 35%) dentro de cada especialidad.
 -- =====================================================================
-\set ON_ERROR_STOP on
-
 DO $$
 BEGIN
     IF NOT (SELECT rolsuper FROM pg_roles WHERE rolname = current_user) THEN
@@ -129,16 +127,16 @@ SELECT ('10.' || c || '.' || (u % 250) || '.' || (10 + u % 200))::inet $$;
 -- 1. Configuracion
 -- ---------------------------------------------------------------------
 CREATE TEMP TABLE cfg AS
-SELECT DATE '2025-05-01' AS f_ini, (CURRENT_DATE + 42) AS f_fin;
+SELECT DATE '2026-02-01' AS f_ini, (CURRENT_DATE + 42) AS f_fin;
 
 CREATE TEMP TABLE cfg_clinica (id_clinica INT PRIMARY KEY, inicio DATE, factor NUMERIC, n_recep INT, n_pac INT, pref_tel TEXT);
 INSERT INTO cfg_clinica VALUES
-    (1, '2025-05-01', 1.00, 4, 11000, '+506 8'),
-    (2, '2025-05-01', 0.85, 3,  6500, '+506 8'),
-    (3, '2025-05-01', 0.78, 3,  5500, '+506 8'),
-    (4, '2025-06-01', 0.58, 2,  3000, '+506 8'),
-    (5, '2025-05-01', 0.90, 3,  8500, '+507 6'),
-    (6, '2026-01-15', 0.80, 2,  1800, '+502 5');
+    (1, '2025-05-01', 1.00, 4, 1100, '+506 8'),
+    (2, '2025-05-01', 0.85, 3,  650, '+506 8'),
+    (3, '2025-05-01', 0.78, 3,  550, '+506 8'),
+    (4, '2025-06-01', 0.58, 2,  300, '+506 8'),
+    (5, '2025-05-01', 0.90, 3,  850, '+507 6'),
+    (6, '2026-01-15', 0.80, 2,  200, '+502 5');
 
 -- profesionales por clinica y especialidad
 CREATE TEMP TABLE cfg_prof_dist (id_clinica INT, id_especialidad INT, n INT);
@@ -215,12 +213,15 @@ FROM base b;
 CREATE TEMP TABLE prof_stage AS
 SELECT row_number() OVER (ORDER BY x.id_usuario) AS id_profesional,
        x.id_clinica, x.id_usuario, x.id_esp AS id_especialidad,
-       CASE WHEN x.p1 < 0.40 THEN 1 WHEN x.p1 < 0.60 THEN 2 WHEN x.p1 < 0.75 THEN 3
+       CASE WHEN x.id_clinica IN (1, 2, 3) AND x.id_esp = 1 AND x.seq IN (1, 2) THEN 1
+            WHEN x.p1 < 0.40 THEN 1 WHEN x.p1 < 0.60 THEN 2 WHEN x.p1 < 0.75 THEN 3
             WHEN x.p1 < 0.90 THEN 4 ELSE 5 END                                   AS patron,
        CASE WHEN x.p2 < 0.12 THEN 0.35 + 0.15 * x.p3 ELSE 0.75 + 0.5 * x.p3 END AS factor,
-       GREATEST(cc.inicio, CASE WHEN x.p4 < 0.08 THEN DATE '2025-05-01' + floor(x.p5 * 420)::int
-                                ELSE DATE '2025-05-01' END)                       AS f_ini,
-       CASE WHEN x.p6 < 0.03 THEN DATE '2026-03-01' + floor(x.p7 * 200)::int
+       CASE WHEN x.id_clinica IN (1, 2, 3) AND x.id_esp = 1 AND x.seq IN (1, 2) THEN cc.inicio
+            ELSE GREATEST(cc.inicio, CASE WHEN x.p4 < 0.08 THEN DATE '2025-05-01' + floor(x.p5 * 420)::int
+                                          ELSE DATE '2025-05-01' END) END        AS f_ini,
+       CASE WHEN x.id_clinica IN (1, 2, 3) AND x.id_esp = 1 AND x.seq IN (1, 2) THEN DATE '2099-12-31'
+            WHEN x.p6 < 0.03 THEN DATE '2026-03-01' + floor(x.p7 * 200)::int
             ELSE DATE '2099-12-31' END                                            AS f_fin,
        CASE WHEN x.p8 < 0.10 THEN 0.45 + 0.20 * x.p9 ELSE 0.85 + 0.15 * x.p9 END AS cumpl
 FROM (SELECT u.*, random() p1, random() p2, random() p3, random() p4, random() p5,
@@ -238,14 +239,24 @@ SELECT u.*,
 FROM u_stage u LEFT JOIN prof_stage p ON p.id_usuario = u.id_usuario;
 
 INSERT INTO usuario (id, id_clinica, id_rol, nombre_usuario, correo, token_sub, activo) OVERRIDING SYSTEM VALUE
-SELECT 1, NULL, 1, 'Administrador Plataforma', 'plataforma@medicitas.test', 'seed-sub-00001', TRUE
+SELECT 1, NULL, 1, 'Administrador Plataforma', 'plataforma@medicitas.test', '20000000-0000-0000-0000-000000000001', TRUE
 UNION ALL
 SELECT u.id_usuario, u.id_clinica, u.id_rol,
        CASE WHEN u.tipo = 'PROF' THEN CASE WHEN u.es_f THEN 'Dra. ' ELSE 'Dr. ' END ELSE '' END
        || CASE WHEN u.es_f THEN pg_temp.nom_f(u.r1) ELSE pg_temp.nom_m(u.r1) END
        || ' ' || pg_temp.ape(u.r2) || ' ' || pg_temp.ape(u.r3),
        'u' || u.id_usuario || '@mc' || u.id_clinica || '.test',
-       'seed-sub-' || lpad(u.id_usuario::text, 5, '0'),
+       CASE
+           WHEN u.id_clinica IN (1, 2, 3) AND u.tipo = 'ADMIN' AND u.seq = 1
+               THEN '20000000-0000-0000-0000-000000000' || u.id_clinica || '01'
+           WHEN u.id_clinica IN (1, 2, 3) AND u.tipo = 'RECEP' AND u.seq = 1
+               THEN '20000000-0000-0000-0000-000000000' || u.id_clinica || '02'
+           WHEN u.id_clinica IN (1, 2, 3) AND u.tipo = 'PROF' AND u.id_esp = 1 AND u.seq = 1
+               THEN '20000000-0000-0000-0000-000000000' || u.id_clinica || '03'
+           WHEN u.id_clinica IN (1, 2, 3) AND u.tipo = 'PROF' AND u.id_esp = 1 AND u.seq = 2
+               THEN '20000000-0000-0000-0000-000000000' || u.id_clinica || '04'
+           ELSE 'seed-sub-' || lpad(u.id_usuario::text, 5, '0')
+       END,
        u.activo
 FROM u_final u;
 
@@ -324,7 +335,8 @@ JOIN cfg_clinica cc ON cc.id_clinica = r.id_clinica
 JOIN clinica cl ON cl.id = r.id_clinica
 JOIN adm a ON a.id_clinica = r.id_clinica
 CROSS JOIN cfg
-WHERE r.d_ini BETWEEN GREATEST(cc.inicio, p.f_ini) AND LEAST(p.f_fin, cfg.f_fin);
+WHERE r.d_ini BETWEEN GREATEST(cfg.f_ini, cc.inicio, p.f_ini) AND LEAST(p.f_fin, cfg.f_fin)
+  AND NOT (r.id_profesional IN (1, 2) AND r.d_ini >= CURRENT_DATE);
 
 INSERT INTO bloqueo_agenda (id, id_clinica, id_profesional, id_servicio, id_usuario, hora_inicio, hora_fin, motivo) OVERRIDING SYSTEM VALUE
 SELECT id_bloqueo, id_clinica, id_profesional, id_servicio, id_usuario, inicio, fin, motivo FROM bloq_stage;
@@ -388,7 +400,7 @@ JOIN clinica cl ON cl.id = p.id_clinica
 JOIN esp_def e ON e.id_especialidad = p.id_especialidad
 JOIN serv_pair sp ON sp.id_clinica = p.id_clinica AND sp.id_especialidad = p.id_especialidad
 CROSS JOIN cfg
-CROSS JOIN LATERAL generate_series(GREATEST(cc.inicio, p.f_ini)::timestamp,
+CROSS JOIN LATERAL generate_series(GREATEST(cfg.f_ini, cc.inicio, p.f_ini)::timestamp,
                                    LEAST(p.f_fin, cfg.f_fin)::timestamp, INTERVAL '1 day') AS d(dia)
 JOIN pat_def h ON h.patron = p.patron AND h.dia = EXTRACT(ISODOW FROM d.dia)::int
 CROSS JOIN LATERAL generate_series(d.dia + h.hi, d.dia + h.hf - make_interval(mins => e.dur),
@@ -407,7 +419,7 @@ ANALYZE slot;
 
 -- probabilidad de ocupacion de cada espacio
 CREATE TEMP TABLE slot_occ AS
-SELECT x.*, (x.u_occ < x.p_occ) AS occ, FALSE AS es_origen, NULL::bigint AS origen_slot
+SELECT x.*, (x.u_occ < x.p_occ AND NOT (x.id_profesional IN (1, 2) AND x.dia >= CURRENT_DATE + 10)) AS occ, FALSE AS es_origen, NULL::bigint AS origen_slot
 FROM (
     SELECT s.*,
         LEAST(0.97,
@@ -526,6 +538,14 @@ WITH choque AS (
     ) z WHERE inicio < fin_previo
 )
 UPDATE c_est e SET estado = 'cancelada' FROM choque c WHERE c.slot_id = e.slot_id;
+
+-- dejar las 2 citas pasadas mas recientes del profesional 1 (clinica 1) en estado 'reservada' para pruebas de RF12 y RF15
+UPDATE c_est SET estado = 'reservada'
+WHERE slot_id IN (
+    SELECT slot_id FROM c_est
+    WHERE id_clinica = 1 AND id_profesional = 1 AND fin <= now() AND NOT es_origen AND estado = 'atendida'
+    ORDER BY inicio DESC LIMIT 2
+);
 
 CREATE TEMP TABLE cita_final AS
 SELECT row_number() OVER (ORDER BY slot_id) AS id, c.* FROM c_est c;
