@@ -3,73 +3,98 @@ using StackExchange.Redis;
 
 namespace Project_Restaurant_API.MediCitas;
 
-public sealed record Slot(Guid ProfesionalId, DateTimeOffset Inicio, DateTimeOffset Fin);
-public sealed record AvailabilityResult(Guid ProfesionalId, DateOnly Fecha, long Version, bool CacheHit, List<Slot> Espacios);
+public sealed record Slot(int ProfesionalId, DateTimeOffset Inicio, DateTimeOffset Fin);
+public sealed record AvailabilityResult(int ProfesionalId, int ServicioId, DateOnly Fecha, bool CacheHit, List<Slot> Espacios);
 
 public sealed class Availability(IConnectionMultiplexer redis, ILogger<Availability> logger)
 {
     public static bool Overlaps(DateTimeOffset start, DateTimeOffset end, DateTimeOffset otherStart, DateTimeOffset otherEnd)
         => start < otherEnd && otherStart < end;
 
-    public async Task<AvailabilityResult> GetAsync(MedicalSession session, Guid professional, Guid service, DateOnly date, CancellationToken ct)
+    public static string BuildHashKey(int clinicaId, int profesionalId)
+        => $"med:disp:{clinicaId}:{profesionalId}";
+
+    public static string BuildFieldKey(int servicioId, DateOnly fecha)
+        => $"{servicioId}:{fecha:yyyy-MM-dd}";
+
+    public async Task<AvailabilityResult> GetAsync(MedicalSession session, int profesionalId, int servicioId, DateOnly fecha, CancellationToken ct)
     {
-        var data = await session.OneAsync("""
-            SELECT c.zona_horaria, c.agenda_version, s.duracion_minutos FROM med.clinicas c
-            JOIN med.servicios s ON s.clinica_id = c.id
-            JOIN med.profesional_servicios ps ON ps.clinica_id = s.clinica_id AND ps.servicio_id = s.id
-            JOIN med.profesionales p ON p.clinica_id = ps.clinica_id AND p.id = ps.profesional_id
-            WHERE p.id = @professional AND s.id = @service AND p.activo AND s.activo
-            """, ct, ("professional", professional), ("service", service));
-        var version = (long)data["agendaVersion"]!;
-        var key = $"med:availability:{session.Identity.ClinicaId}:{professional}:{service}:{date:yyyy-MM-dd}:v{version}";
+        var clinicaId = session.Identity.ClinicaId ?? throw new DomainException(403, "Contexto de clinica requerido.");
+        var hashKey = BuildHashKey(clinicaId, profesionalId);
+        var fieldKey = BuildFieldKey(servicioId, fecha);
+
         try
         {
-            var cached = await redis.GetDatabase().StringGetAsync(key);
+            var db = redis.GetDatabase();
+            var cached = await db.HashGetAsync(hashKey, fieldKey);
             if (cached.HasValue)
             {
                 var parsed = JsonSerializer.Deserialize<List<Slot>>(cached.ToString());
-                if (parsed is not null) return new(professional, date, version, true, parsed);
+                if (parsed is not null)
+                    return new AvailabilityResult(profesionalId, servicioId, fecha, true, parsed);
             }
         }
         catch (Exception ex) when (ex is RedisException or TimeoutException or JsonException)
         {
-            logger.LogWarning("Consulta de cache no disponible: {Type}", ex.GetType().Name);
+            logger.LogWarning("Consulta de cache Redis no disponible: {Type}", ex.GetType().Name);
         }
-        var zone = TimeZoneInfo.FindSystemTimeZoneById((string)data["zonaHoraria"]!);
-        var duration = (int)data["duracionMinutos"]!;
-        var weekday = date.DayOfWeek == DayOfWeek.Sunday ? 7 : (int)date.DayOfWeek;
-        var hours = await session.QueryAsync("SELECT inicio, fin FROM med.horarios WHERE profesional_id = @professional AND dia_semana = @day ORDER BY inicio",
-            ct, ("professional", professional), ("day", weekday));
-        var dayStart = TimeZoneInfo.ConvertTimeToUtc(date.ToDateTime(TimeOnly.MinValue), zone);
-        var dayEnd = TimeZoneInfo.ConvertTimeToUtc(date.AddDays(1).ToDateTime(TimeOnly.MinValue), zone);
-        var busy = await session.QueryAsync("""
-            SELECT inicio, fin FROM med.citas WHERE profesional_id = @professional AND estado = 'reservada'
-                AND inicio < @end AND fin > @start
-            UNION ALL SELECT inicio, fin FROM med.bloqueos WHERE profesional_id = @professional
-                AND inicio < @end AND fin > @start
-            """, ct, ("professional", professional), ("start", dayStart), ("end", dayEnd));
-        var slots = new List<Slot>();
-        foreach (var block in hours)
+
+        var rows = await session.CallCursorAsync(
+            "SP_ConsultarDisponibilidadProfesional",
+            ct,
+            ("userName", session.Identity.NombreUsuario),
+            ("idProfesional", profesionalId),
+            ("idServicio", servicioId),
+            ("fecha", fecha));
+
+        var slots = new List<Slot>(rows.Count);
+        foreach (var row in rows)
         {
-            var start = date.ToDateTime((TimeOnly)block["inicio"]!);
-            var end = date.ToDateTime((TimeOnly)block["fin"]!);
-            for (var local = start; local.AddMinutes(duration) <= end; local = local.AddMinutes(duration))
+            var start = row["horaInicio"] switch
             {
-                if (zone.IsInvalidTime(local) || zone.IsInvalidTime(local.AddMinutes(duration))) continue;
-                var utc = new DateTimeOffset(TimeZoneInfo.ConvertTimeToUtc(local, zone));
-                var finish = utc.AddMinutes(duration);
-                if (!busy.Any(b => Overlaps(utc, finish, new DateTimeOffset((DateTime)b["inicio"]!), new DateTimeOffset((DateTime)b["fin"]!))))
-                    slots.Add(new Slot(professional, utc, finish));
-            }
+                DateTimeOffset dto => dto,
+                DateTime dt => new DateTimeOffset(DateTime.SpecifyKind(dt, DateTimeKind.Utc)),
+                _ => throw new DomainException(500, "Formato de hora_inicio inesperado.")
+            };
+            var end = row["horaFin"] switch
+            {
+                DateTimeOffset dto => dto,
+                DateTime dt => new DateTimeOffset(DateTime.SpecifyKind(dt, DateTimeKind.Utc)),
+                _ => throw new DomainException(500, "Formato de hora_fin inesperado.")
+            };
+            slots.Add(new Slot(profesionalId, start, end));
         }
+
         try
         {
-            await redis.GetDatabase().StringSetAsync(key, JsonSerializer.Serialize(slots), TimeSpan.FromMinutes(5));
+            var db = redis.GetDatabase();
+            await db.HashSetAsync(hashKey, fieldKey, JsonSerializer.Serialize(slots));
+            await db.KeyExpireAsync(hashKey, TimeSpan.FromMinutes(5));
         }
         catch (Exception ex) when (ex is RedisException or TimeoutException)
         {
-            logger.LogWarning("Escritura de cache no disponible: {Type}", ex.GetType().Name);
+            logger.LogWarning("Escritura de cache Redis no disponible: {Type}", ex.GetType().Name);
         }
-        return new(professional, date, version, false, slots);
+
+        return new AvailabilityResult(profesionalId, servicioId, fecha, false, slots);
+    }
+
+    public async Task InvalidateProfessionalAsync(int clinicaId, int profesionalId)
+    {
+        try
+        {
+            var db = redis.GetDatabase();
+            await db.KeyDeleteAsync(BuildHashKey(clinicaId, profesionalId));
+        }
+        catch (Exception ex) when (ex is RedisException or TimeoutException)
+        {
+            logger.LogWarning("Invalidacion de cache Redis no disponible: {Type}", ex.GetType().Name);
+        }
+    }
+
+    public async Task InvalidateProfessionalsAsync(int clinicaId, IEnumerable<int> profesionalIds)
+    {
+        foreach (var id in profesionalIds.Distinct())
+            await InvalidateProfessionalAsync(clinicaId, id);
     }
 }

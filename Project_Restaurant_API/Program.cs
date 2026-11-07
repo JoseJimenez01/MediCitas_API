@@ -1,17 +1,14 @@
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
-using Microsoft.EntityFrameworkCore;
 using Microsoft.IdentityModel.Tokens;
 using Microsoft.OpenApi.Models;
 using Npgsql;
 using Project_Restaurant_API.Auth;
-using Project_Restaurant_API.Data;
 using Project_Restaurant_API.MediCitas;
 using StackExchange.Redis;
 
 var builder = WebApplication.CreateBuilder(args);
 var config = builder.Configuration;
-var legacyConnection = new NpgsqlConnectionStringBuilder(MedicalDatabase.Connection(config)) { Options = "-c role=med_legacy" };
 builder.Services.AddControllers();
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen(options =>
@@ -26,7 +23,6 @@ builder.Services.AddSwaggerGen(options =>
         [new OpenApiSecurityScheme { Reference = new OpenApiReference { Type = ReferenceType.SecurityScheme, Id = "Bearer" } }] = []
     });
 });
-builder.Services.AddDbContext<RestaurantContext>(options => options.UseNpgsql(legacyConnection.ConnectionString));
 builder.Services.AddSingleton<MedicalDatabase>();
 builder.Services.AddSingleton<IConnectionMultiplexer>(_ => ConnectionMultiplexer.Connect(new ConfigurationOptions
 {
@@ -59,8 +55,7 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme).AddJw
         ClockSkew = TimeSpan.FromSeconds(30)
     };
 });
-builder.Services.AddAuthorization(options => options.AddPolicy("Escritura",
-    p => p.RequireRole(config["KEYCLOAK_REQUIRED_ROLE"] ?? "api-writer")));
+builder.Services.AddAuthorization();
 builder.Services.AddSingleton<IClaimsTransformation, KeycloakClaimsTransformation>();
 
 var app = builder.Build();
@@ -83,7 +78,7 @@ app.Use(async (context, next) =>
             "23P01" => (409, "El espacio ya esta ocupado o se solapa con otro intervalo."),
             "23505" => (409, "El recurso ya existe."),
             "23503" or "P0002" => (400, "Una referencia no existe o no pertenece a su clinica."),
-            "23514" or "22007" or "22008" or "22023" => (400, "La solicitud incumple las reglas del dominio."),
+            "23514" or "22007" or "22008" or "22023" or "22001" => (400, "La solicitud incumple las reglas del dominio."),
             "P0001" => (409, "La transicion de estado no esta permitida."),
             "40P01" or "40001" or "55P03" => (409, "Conflicto concurrente; vuelva a intentar la operacion."),
             "42501" => (403, "Acceso no permitido."),
