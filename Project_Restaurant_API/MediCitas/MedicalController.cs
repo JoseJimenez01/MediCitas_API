@@ -807,14 +807,23 @@ public sealed class MedicalController(MedicalDatabase database, Availability ava
             ("userName", s.Identity.NombreUsuario),
             ("idCita", id));
         var oldProf = Convert.ToInt32(old["idProfesional"]!);
-        var outRow = await s.CallOutAsync(
-            "SP_ReprogramarCita",
-            2,
-            ct,
-            ("userName", s.Identity.NombreUsuario),
-            ("idCita", id),
-            ("nuevaHoraInicio", input.Inicio.UtcDateTime),
-            ("nuevoIdProfesional", input.ProfesionalId));
+        var oldEstado = old["estado"]?.ToString();
+        Dictionary<string, object?> outRow;
+        try
+        {
+            outRow = await s.CallOutAsync(
+                "SP_ReprogramarCita",
+                2,
+                ct,
+                ("userName", s.Identity.NombreUsuario),
+                ("idCita", id),
+                ("nuevaHoraInicio", input.Inicio.UtcDateTime),
+                ("nuevoIdProfesional", input.ProfesionalId));
+        }
+        catch (DomainException ex) when (ex.Status == 400 && oldEstado != "reservada")
+        {
+            throw new DomainException(409, "La cita ya se encuentra en un estado final y no admite cambios.");
+        }
         var idCitaNueva = Convert.ToInt32(outRow["outidcitanueva"]!);
         var row = await s.CallCursorOneAsync(
             "SP_ConsultarCita",
@@ -839,14 +848,22 @@ public sealed class MedicalController(MedicalDatabase database, Availability ava
             ("userName", s.Identity.NombreUsuario),
             ("idCita", id));
         var idProfesional = Convert.ToInt32(old["idProfesional"]!);
-        await s.CallOutAsync(
-            "SP_CancelarCita",
-            1,
-            ct,
-            ("userName", s.Identity.NombreUsuario),
-            ("idCita", id),
-            ("motivo", input.Motivo.Trim()),
-            ("idUsuario", s.Identity.Id));
+        var oldEstado = old["estado"]?.ToString();
+        try
+        {
+            await s.CallOutAsync(
+                "SP_CancelarCita",
+                1,
+                ct,
+                ("userName", s.Identity.NombreUsuario),
+                ("idCita", id),
+                ("motivo", input.Motivo.Trim()),
+                ("idUsuario", s.Identity.Id));
+        }
+        catch (DomainException ex) when (ex.Status == 400 && oldEstado != "reservada")
+        {
+            throw new DomainException(409, "La cita ya se encuentra en un estado final y no admite cambios.");
+        }
         var row = await s.CallCursorOneAsync(
             "SP_ConsultarCita",
             ct,
@@ -869,14 +886,22 @@ public sealed class MedicalController(MedicalDatabase database, Availability ava
             ("userName", s.Identity.NombreUsuario),
             ("idCita", id));
         var idProfesional = Convert.ToInt32(old["idProfesional"]!);
+        var oldEstado = old["estado"]?.ToString();
         OwnProfessional(s, idProfesional);
-        await s.CallOutAsync(
-            "SP_RegistrarDesenlaceCita",
-            1,
-            ct,
-            ("userName", s.Identity.NombreUsuario),
-            ("idCita", id),
-            ("estado", input.Estado));
+        try
+        {
+            await s.CallOutAsync(
+                "SP_RegistrarDesenlaceCita",
+                1,
+                ct,
+                ("userName", s.Identity.NombreUsuario),
+                ("idCita", id),
+                ("estado", input.Estado));
+        }
+        catch (DomainException ex) when (ex.Status == 400 && oldEstado != "reservada")
+        {
+            throw new DomainException(409, "La cita ya se encuentra en un estado final y no admite cambios.");
+        }
         var row = await s.CallCursorOneAsync(
             "SP_ConsultarCita",
             ct,
@@ -893,15 +918,29 @@ public sealed class MedicalController(MedicalDatabase database, Availability ava
     public async Task<IActionResult> AddNote(int id, NotaInput input, CancellationToken ct)
     {
         await using var s = await Open(ct, ["professional"]);
-        var outRow = await s.CallOutAsync(
-            "SP_CrearNotaClinica",
-            2,
+        var cita = await s.CallCursorOneAsync(
+            "SP_ConsultarCita",
             ct,
             ("userName", s.Identity.NombreUsuario),
-            ("idUsuario", s.Identity.Id),
-            ("ip", s.ClientIp),
-            ("idCita", id),
-            ("contenido", input.Contenido.Trim()));
+            ("idCita", id));
+        var citaProf = Convert.ToInt32(cita["idProfesional"]!);
+        Dictionary<string, object?> outRow;
+        try
+        {
+            outRow = await s.CallOutAsync(
+                "SP_CrearNotaClinica",
+                2,
+                ct,
+                ("userName", s.Identity.NombreUsuario),
+                ("idUsuario", s.Identity.Id),
+                ("ip", s.ClientIp),
+                ("idCita", id),
+                ("contenido", input.Contenido.Trim()));
+        }
+        catch (DomainException ex) when (ex.Status == 400 && citaProf != s.Identity.ProfesionalId)
+        {
+            throw new DomainException(403, "Solo el profesional que atendio la cita puede registrar su nota clinica.");
+        }
         var idNota = Convert.ToInt32(outRow["outidnotaclinica"]!);
         await s.CommitAsync(ct);
         return StatusCode(201, new

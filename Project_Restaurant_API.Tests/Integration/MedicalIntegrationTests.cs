@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Net;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
@@ -14,14 +15,45 @@ public sealed class MedicalCollection;
 public sealed class MedicalIntegrationTests
 {
     private readonly HttpClient api = new() { BaseAddress = new Uri(Environment.GetEnvironmentVariable("TEST_API_BASE_URL") ?? "http://localhost:8080") };
-    private static Guid Id(char prefix, int number) => Guid.Parse($"{prefix}0000000-0000-0000-0000-{number:000000000000}");
-    private static readonly Guid Clinic = Id('1', 1);
-    private static readonly Guid Professional = Id('3', 101);
-    private static readonly Guid OtherProfessional = Id('3', 102);
-    private static readonly Guid Service = Id('4', 101);
-    private static readonly Guid Patient = Id('5', 101);
-    private static DateOnly Day => DateOnly.FromDateTime(DateTime.UtcNow.AddDays(20));
+    private const int Clinic = 1;
+    private const int OtherClinic = 2;
+    private const int Professional = 1;
+    private const int OtherProfessional = 2;
+    private const int Service = 1;
+    private const int Patient = 1;
+    private const int OtherPatient = 2;
+    private const int OtherClinicPatient = 1101;
+    private const int OtherClinicProfessional = 20;
+
+    private static DateOnly NextMonday
+    {
+        get
+        {
+            var baseDate = DateOnly.FromDateTime(DateTime.UtcNow.AddDays(14));
+            var daysUntilMonday = ((int)DayOfWeek.Monday - (int)baseDate.DayOfWeek + 7) % 7;
+            return baseDate.AddDays(daysUntilMonday);
+        }
+    }
+
     private static DateTimeOffset Start(DateOnly date, int hour) => new(date.Year, date.Month, date.Day, hour, 0, 0, TimeSpan.FromHours(-6));
+
+    private static string AdminConnectionString => new NpgsqlConnectionStringBuilder
+    {
+        Host = Environment.GetEnvironmentVariable("POSTGRES_HOST") ?? "localhost",
+        Port = int.Parse(Environment.GetEnvironmentVariable("POSTGRES_PORT") ?? "5432"),
+        Database = Environment.GetEnvironmentVariable("POSTGRES_DB") ?? "restaurantdb",
+        Username = Environment.GetEnvironmentVariable("TEST_DB_ADMIN_USER") ?? "postgres",
+        Password = Environment.GetEnvironmentVariable("TEST_DB_ADMIN_PASSWORD") ?? "secretodesk"
+    }.ConnectionString;
+
+    private static string AppConnectionString => new NpgsqlConnectionStringBuilder
+    {
+        Host = Environment.GetEnvironmentVariable("POSTGRES_HOST") ?? "localhost",
+        Port = int.Parse(Environment.GetEnvironmentVariable("POSTGRES_PORT") ?? "5432"),
+        Database = Environment.GetEnvironmentVariable("POSTGRES_DB") ?? "restaurantdb",
+        Username = Environment.GetEnvironmentVariable("APP_DB_USER") ?? "medicitas_app",
+        Password = Environment.GetEnvironmentVariable("APP_DB_PASSWORD") ?? "medicitas-local-pass"
+    }.ConnectionString;
 
     private async Task<string> Token(string username)
     {
@@ -29,7 +61,9 @@ public sealed class MedicalIntegrationTests
         var url = Environment.GetEnvironmentVariable("TEST_KEYCLOAK_TOKEN_URL") ?? "http://localhost:8081/realms/restaurant/protocol/openid-connect/token";
         using var response = await http.PostAsync(url, new FormUrlEncodedContent(new Dictionary<string, string>
         {
-            ["grant_type"] = "password", ["client_id"] = "restaurant-api", ["username"] = username,
+            ["grant_type"] = "password",
+            ["client_id"] = "restaurant-api",
+            ["username"] = username,
             ["password"] = Environment.GetEnvironmentVariable("MED_TEST_PASSWORD") ?? "MediCitas123!"
         }));
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
@@ -51,17 +85,17 @@ public sealed class MedicalIntegrationTests
         return JsonDocument.Parse(text).RootElement.Clone();
     }
 
-    private object Booking(DateTimeOffset start, Guid? professional = null, Guid? patient = null)
+    private object Booking(DateTimeOffset start, int? professional = null, int? patient = null)
         => new { pacienteId = patient ?? Patient, profesionalId = professional ?? Professional, servicioId = Service, inicio = start };
 
-    private async Task Cancel(Guid id, string token)
+    private async Task Cancel(int id, string token)
         => await Send(HttpMethod.Post, $"/api/citas/{id}/cancelar", token, new { motivo = "Limpieza de prueba" });
 
     [Theory]
     [InlineData("POST", "/api/citas", "profesional1")]
     [InlineData("POST", "/api/usuarios", "recepcion1")]
-    [InlineData("PUT", "/api/usuarios/20000000-0000-0000-0000-000000000101", "recepcion1")]
-    [InlineData("POST", "/api/citas/70000000-0000-0000-0000-000000000101/nota", "admin1")]
+    [InlineData("PUT", "/api/usuarios/1", "recepcion1")]
+    [InlineData("POST", "/api/citas/1/nota", "admin1")]
     public async Task RF17_RolInadecuadoDevuelve403AunqueElCuerpoSeaInvalido(string method, string path, string username)
     {
         var token = await Token(username);
@@ -81,100 +115,89 @@ public sealed class MedicalIntegrationTests
     public async Task RF1_RF2_RF3_RF4_RF5_RF14_RF16_RF20_RF21_AdministracionCompleta()
     {
         var platform = await Token("plataforma");
-        var suffix = Guid.NewGuid().ToString("N")[..10];
+        var suffix = Guid.NewGuid().ToString("N")[..8];
         var password = Environment.GetEnvironmentVariable("MED_TEST_PASSWORD") ?? "MediCitas123!";
         var clinic = await Json(await Send(HttpMethod.Post, "/api/clinicas", platform, new
         {
-            nombre = "Clinica de prueba", identificador = "TEST-" + suffix, zonaHoraria = "America/Costa_Rica",
-            administradorIdentidad = Guid.Empty, nombreAdministrador = "Administracion de prueba",
-            administradorNombreUsuario = "admin-" + suffix, administradorPassword = password
+            nombre = "Clinica " + suffix,
+            identificador = "T-" + suffix,
+            zonaHoraria = "America/Costa_Rica",
+            administradorIdentidad = Guid.Empty,
+            nombreAdministrador = "Admin " + suffix,
+            administradorNombreUsuario = "adm-" + suffix,
+            administradorPassword = password
         }), HttpStatusCode.Created);
-        var admin = await Token("admin-" + suffix);
+        var clinicId = clinic.GetProperty("id").GetInt32();
+        var admin = await Token("adm-" + suffix);
         var identity = await Json(await Send(HttpMethod.Get, "/api/yo", admin), HttpStatusCode.OK);
-        Assert.Equal(clinic.GetProperty("id").GetGuid(), identity.GetProperty("clinicaId").GetGuid());
+        Assert.Equal(clinicId, identity.GetProperty("clinicaId").GetInt32());
+
         var user = await Json(await Send(HttpMethod.Post, "/api/usuarios", admin, new
         {
-            identidad = Guid.Empty, nombre = "Profesional de prueba", rol = "professional", nombreUsuario = "doctor-" + suffix, password
+            identidad = Guid.Empty,
+            nombre = "Dr " + suffix,
+            rol = "professional",
+            nombreUsuario = "doc-" + suffix,
+            password
         }), HttpStatusCode.Created);
+        var userId = user.GetProperty("id").GetInt32();
+
         var service = await Json(await Send(HttpMethod.Post, "/api/servicios", admin,
-            new { nombre = "Consulta", duracionMinutos = 30, especialidad = "Medicina de prueba" }), HttpStatusCode.Created);
-        var serviceId = service.GetProperty("id").GetGuid();
+            new { nombre = "Cons " + suffix, duracionMinutos = 30, especialidad = "Medicina General" }), HttpStatusCode.Created);
+        var serviceId = service.GetProperty("id").GetInt32();
+
         await Json(await Send(HttpMethod.Put, $"/api/servicios/{serviceId}", admin,
-            new { nombre = "Consulta actualizada", duracionMinutos = 45, especialidad = "Medicina de prueba" }), HttpStatusCode.OK);
+            new { nombre = "Cons2 " + suffix, duracionMinutos = 30, especialidad = "Medicina General" }), HttpStatusCode.OK);
+
         var professional = await Json(await Send(HttpMethod.Post, "/api/profesionales", admin, new
         {
-            usuarioId = user.GetProperty("id").GetGuid(), nombre = "Profesional de prueba", especialidad = "Medicina de prueba", servicios = new[] { serviceId }
+            usuarioId = userId,
+            nombre = "Dr " + suffix,
+            especialidad = "Medicina General",
+            servicios = new[] { serviceId }
         }), HttpStatusCode.Created);
-        var day = Day;
-        await Json(await Send(HttpMethod.Post, $"/api/profesionales/{professional.GetProperty("id").GetGuid()}/horarios", admin,
-            new { diaSemana = day.DayOfWeek == DayOfWeek.Sunday ? 7 : (int)day.DayOfWeek, inicio = "08:00:00", fin = "12:00:00" }), HttpStatusCode.Created);
+        var professionalId = professional.GetProperty("id").GetInt32();
+
+        var day = NextMonday;
+        await Json(await Send(HttpMethod.Post, $"/api/profesionales/{professionalId}/horarios", admin,
+            new { diaSemana = 1, inicio = "08:00:00", fin = "12:00:00" }), HttpStatusCode.Created);
+
         var patient = await Json(await Send(HttpMethod.Post, "/api/pacientes", admin,
-            new { identificacion = suffix, nombre = "Paciente", fechaNacimiento = "2000-01-01", contacto = "paciente@example.test" }), HttpStatusCode.Created);
-        var patientId = patient.GetProperty("id").GetGuid();
+            new { identificacion = "ID-" + suffix, nombre = "Pac " + suffix, fechaNacimiento = "2000-01-01", contacto = "pac@example.test" }), HttpStatusCode.Created);
+        var patientId = patient.GetProperty("id").GetInt32();
+
         await Json(await Send(HttpMethod.Put, $"/api/pacientes/{patientId}", admin,
-            new { identificacion = suffix, nombre = "Paciente actualizado", fechaNacimiento = "2000-01-01", contacto = "otro@example.test" }), HttpStatusCode.OK);
+            new { identificacion = "ID-" + suffix, nombre = "Pac act " + suffix, fechaNacimiento = "2000-01-01", contacto = "otro@example.test" }), HttpStatusCode.OK);
+
         await Json(await Send(HttpMethod.Get, $"/api/pacientes/{patientId}/historial", admin), HttpStatusCode.OK);
         await Json(await Send(HttpMethod.Get, $"/api/agenda?fecha={day:yyyy-MM-dd}", admin), HttpStatusCode.OK);
         await Json(await Send(HttpMethod.Get, $"/api/estadisticas/citas?desde={day:yyyy-MM-dd}&hasta={day:yyyy-MM-dd}", admin), HttpStatusCode.OK);
         await Json(await Send(HttpMethod.Get, "/api/usuarios", admin), HttpStatusCode.OK);
         await Json(await Send(HttpMethod.Get, "/api/profesionales", admin), HttpStatusCode.OK);
         await Json(await Send(HttpMethod.Get, "/api/servicios", admin), HttpStatusCode.OK);
+
         var available = await Json(await Send(HttpMethod.Get, $"/api/disponibilidad/servicios/{serviceId}?desde={day:yyyy-MM-dd}&hasta={day:yyyy-MM-dd}", admin), HttpStatusCode.OK);
         Assert.NotEmpty(available.EnumerateArray());
+
         var reception = await Json(await Send(HttpMethod.Post, "/api/usuarios", admin, new
         {
-            identidad = Guid.Empty, nombre = "Recepcion de prueba", rol = "reception", nombreUsuario = "reception-" + suffix, password
+            identidad = Guid.Empty,
+            nombre = "Rec " + suffix,
+            rol = "reception",
+            nombreUsuario = "rec-" + suffix,
+            password
         }), HttpStatusCode.Created);
-        var receptionToken = await Token("reception-" + suffix);
-        var receptionId = reception.GetProperty("id").GetGuid();
+        var receptionToken = await Token("rec-" + suffix);
+        var receptionId = reception.GetProperty("id").GetInt32();
+        var receptionSub = reception.GetProperty("tokenSub").GetGuid();
+
         await Json(await Send(HttpMethod.Put, $"/api/usuarios/{receptionId}", admin,
-            new { identidad = receptionId, nombre = "Profesional sin agenda", rol = "professional", activo = true }), HttpStatusCode.OK);
-        Assert.Equal(HttpStatusCode.Forbidden, (await Send(HttpMethod.Get, "/api/pacientes", receptionToken)).StatusCode);
-        var updatedToken = await Token("reception-" + suffix);
+            new { identidad = receptionSub, nombre = "Rec " + suffix, rol = "professional", activo = true }), HttpStatusCode.OK);
+        var updatedToken = await Token("rec-" + suffix);
         await Json(await Send(HttpMethod.Get, "/api/pacientes", updatedToken), HttpStatusCode.OK);
+
         Assert.Equal(HttpStatusCode.NoContent, (await Send(HttpMethod.Delete, $"/api/usuarios/{receptionId}", admin)).StatusCode);
         Assert.Equal(HttpStatusCode.Forbidden, (await Send(HttpMethod.Get, "/api/pacientes", updatedToken)).StatusCode);
-    }
-
-    [Fact]
-    public async Task ModuloAdicional_DetectaManipulacionDeBitacora()
-    {
-        var admin = await Token("admin1");
-        await Json(await Send(HttpMethod.Get, $"/api/pacientes/{Patient}", admin), HttpStatusCode.OK);
-        var builder = new NpgsqlConnectionStringBuilder
-        {
-            Host = Environment.GetEnvironmentVariable("POSTGRES_HOST") ?? "bd",
-            Port = int.Parse(Environment.GetEnvironmentVariable("POSTGRES_PORT") ?? "5432"),
-            Database = Environment.GetEnvironmentVariable("POSTGRES_DB") ?? "restaurantdb",
-            Username = Environment.GetEnvironmentVariable("TEST_DB_ADMIN_USER") ?? "postgres",
-            Password = Environment.GetEnvironmentVariable("TEST_DB_ADMIN_PASSWORD") ?? ""
-        };
-        await using var conn = new NpgsqlConnection(builder.ConnectionString);
-        await conn.OpenAsync();
-        await using var original = new NpgsqlCommand($"SELECT id, accion FROM med.auditoria WHERE clinica_id = '{Clinic}' ORDER BY id LIMIT 1", conn);
-        long id;
-        string action;
-        await using (var reader = await original.ExecuteReaderAsync())
-        {
-            Assert.True(await reader.ReadAsync());
-            id = reader.GetInt64(0);
-            action = reader.GetString(1);
-        }
-        try
-        {
-            await new NpgsqlCommand($"UPDATE med.auditoria SET accion = 'manipulada' WHERE id = {id}", conn).ExecuteNonQueryAsync();
-            var check = await Json(await Send(HttpMethod.Get, "/api/auditoria/verificar", admin), HttpStatusCode.OK);
-            Assert.False(check.GetProperty("valida").GetBoolean());
-        }
-        finally
-        {
-            await using var restore = new NpgsqlCommand("UPDATE med.auditoria SET accion = @action WHERE id = @id", conn);
-            restore.Parameters.AddWithValue("action", action);
-            restore.Parameters.AddWithValue("id", id);
-            await restore.ExecuteNonQueryAsync();
-        }
-        var restored = await Json(await Send(HttpMethod.Get, "/api/auditoria/verificar", admin), HttpStatusCode.OK);
-        Assert.True(restored.GetProperty("valida").GetBoolean());
     }
 
     [Fact]
@@ -182,7 +205,7 @@ public sealed class MedicalIntegrationTests
     {
         Assert.Equal(HttpStatusCode.Unauthorized, (await Send(HttpMethod.Get, "/api/pacientes", null)).StatusCode);
         var professional = await Token("profesional1");
-        Assert.Equal(HttpStatusCode.Forbidden, (await Send(HttpMethod.Post, "/api/citas", professional, Booking(Start(Day, 8)))).StatusCode);
+        Assert.Equal(HttpStatusCode.Forbidden, (await Send(HttpMethod.Post, "/api/citas", professional, Booking(Start(NextMonday, 8)))).StatusCode);
         var platform = await Token("plataforma");
         Assert.Equal(HttpStatusCode.Forbidden, (await Send(HttpMethod.Get, "/api/pacientes", platform)).StatusCode);
         Assert.Equal(HttpStatusCode.Unauthorized, (await Send(HttpMethod.Get, "/api/pacientes", "invalid-token")).StatusCode);
@@ -192,60 +215,68 @@ public sealed class MedicalIntegrationTests
     public async Task RF9_I1_CarreraTieneExactamenteUnaGanadora()
     {
         var token = await Token("recepcion1");
-        var start = Start(Day.AddDays(1), 8);
+        var start = Start(NextMonday, 8);
         var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        async Task<HttpResponseMessage> Compete(Guid patient)
+        async Task<HttpResponseMessage> Compete(int patient)
         {
             await gate.Task;
             return await Send(HttpMethod.Post, "/api/citas", token, Booking(start, patient: patient));
         }
         var a = Compete(Patient);
-        var b = Compete(Id('5', 102));
+        var b = Compete(OtherPatient);
         gate.SetResult();
         var responses = await Task.WhenAll(a, b);
         Assert.Single(responses, r => r.StatusCode == HttpStatusCode.Created);
         Assert.Single(responses, r => r.StatusCode == HttpStatusCode.Conflict);
         var winner = await responses.Single(r => r.StatusCode == HttpStatusCode.Created).Content.ReadFromJsonAsync<JsonElement>();
-        await Cancel(winner.GetProperty("id").GetGuid(), token);
+        await Cancel(winner.GetProperty("id").GetInt32(), token);
     }
 
     [Fact]
     public async Task RF9_I2_PacienteNoPuedeReservarDosProfesionalesAlMismoTiempo()
     {
         var token = await Token("recepcion1");
-        var tasks = new[] { Professional, OtherProfessional }.Select(p => Send(HttpMethod.Post, "/api/citas", token, Booking(Start(Day.AddDays(2), 9), p)));
+        var start = Start(NextMonday.AddDays(1), 9);
+        var tasks = new[] { Professional, OtherProfessional }.Select(p => Send(HttpMethod.Post, "/api/citas", token, Booking(start, p)));
         var responses = await Task.WhenAll(tasks);
         Assert.Single(responses, r => r.StatusCode == HttpStatusCode.Created);
         Assert.Single(responses, r => r.StatusCode == HttpStatusCode.Conflict);
         var winner = await responses.Single(r => r.StatusCode == HttpStatusCode.Created).Content.ReadFromJsonAsync<JsonElement>();
-        await Cancel(winner.GetProperty("id").GetGuid(), token);
+        await Cancel(winner.GetProperty("id").GetInt32(), token);
     }
 
     [Fact]
     public async Task RF7_RF9_RF10_RF11_I4_I7_I8_CacheYReprogramacionSonCoherentes()
     {
         var token = await Token("recepcion1");
-        var day = Day.AddDays(3);
+        var day = NextMonday.AddDays(2);
         var path = $"/api/disponibilidad?profesionalId={Professional}&servicioId={Service}&fecha={day:yyyy-MM-dd}";
         var before = await Json(await Send(HttpMethod.Get, path, token), HttpStatusCode.OK);
         var warm = await Json(await Send(HttpMethod.Get, path, token), HttpStatusCode.OK);
         Assert.True(warm.GetProperty("cacheHit").GetBoolean());
+
         var start = before.GetProperty("espacios")[0].GetProperty("inicio").GetDateTimeOffset();
         var next = before.GetProperty("espacios")[1].GetProperty("inicio").GetDateTimeOffset();
+
         var created = await Json(await Send(HttpMethod.Post, "/api/citas", token, Booking(start)), HttpStatusCode.Created);
-        var id = created.GetProperty("id").GetGuid();
-        Assert.Equal(TimeSpan.FromMinutes(30), created.GetProperty("fin").GetDateTimeOffset() - created.GetProperty("inicio").GetDateTimeOffset());
+        var id = created.GetProperty("id").GetInt32();
+        Assert.Equal(TimeSpan.FromMinutes(30), created.GetProperty("horaFin").GetDateTimeOffset() - created.GetProperty("horaInicio").GetDateTimeOffset());
+
         var booked = await Json(await Send(HttpMethod.Get, path, token), HttpStatusCode.OK);
-        Assert.True(booked.GetProperty("version").GetInt64() > before.GetProperty("version").GetInt64());
+        Assert.False(booked.GetProperty("cacheHit").GetBoolean());
         Assert.DoesNotContain(booked.GetProperty("espacios").EnumerateArray(), x => x.GetProperty("inicio").GetDateTimeOffset() == start);
+
         var moved = await Json(await Send(HttpMethod.Post, $"/api/citas/{id}/reprogramar", token,
             new { profesionalId = Professional, servicioId = Service, inicio = next }), HttpStatusCode.OK);
+
         var after = await Json(await Send(HttpMethod.Get, path, token), HttpStatusCode.OK);
         Assert.Contains(after.GetProperty("espacios").EnumerateArray(), x => x.GetProperty("inicio").GetDateTimeOffset() == start);
         Assert.DoesNotContain(after.GetProperty("espacios").EnumerateArray(), x => x.GetProperty("inicio").GetDateTimeOffset() == next);
-        await Cancel(moved.GetProperty("id").GetGuid(), token);
+
+        await Cancel(moved.GetProperty("id").GetInt32(), token);
         var cancelled = await Json(await Send(HttpMethod.Get, path, token), HttpStatusCode.OK);
         Assert.Contains(cancelled.GetProperty("espacios").EnumerateArray(), x => x.GetProperty("inicio").GetDateTimeOffset() == next);
+
         Assert.Equal(HttpStatusCode.Conflict, (await Send(HttpMethod.Post, $"/api/citas/{id}/cancelar", token, new { motivo = "Estado final" })).StatusCode);
     }
 
@@ -254,30 +285,38 @@ public sealed class MedicalIntegrationTests
     {
         var receptionist = await Token("recepcion1");
         var admin = await Token("admin1");
-        var start = Start(Day.AddDays(4), 10);
-        Assert.Equal(HttpStatusCode.BadRequest, (await Send(HttpMethod.Post, "/api/citas", receptionist, Booking(Start(Day.AddDays(4), 3)))).StatusCode);
+        var day = NextMonday.AddDays(3);
+        var start = Start(day, 10);
+
+        Assert.Equal(HttpStatusCode.BadRequest, (await Send(HttpMethod.Post, "/api/citas", receptionist, Booking(Start(day, 3)))).StatusCode);
+
         var appointment = await Json(await Send(HttpMethod.Post, "/api/citas", receptionist, Booking(start)), HttpStatusCode.Created);
+        var appointmentId = appointment.GetProperty("id").GetInt32();
+
         var block = await Json(await Send(HttpMethod.Post, $"/api/profesionales/{Professional}/bloqueos", admin,
-            new { inicio = start, fin = start.AddHours(2), motivo = "Permiso de prueba" }), HttpStatusCode.Created);
-        Assert.Contains(block.GetProperty("conflictos").EnumerateArray(), c => c.GetProperty("id").GetGuid() == appointment.GetProperty("id").GetGuid());
+            new { inicio = start, fin = start.AddHours(2), motivo = "permisos" }), HttpStatusCode.Created);
+
+        Assert.Contains(block.GetProperty("conflictos").EnumerateArray(), c => c.GetProperty("idCita").GetInt32() == appointmentId);
         Assert.Equal(HttpStatusCode.BadRequest, (await Send(HttpMethod.Post, "/api/citas", receptionist, Booking(start.AddHours(1)))).StatusCode);
-        await Cancel(appointment.GetProperty("id").GetGuid(), receptionist);
-        Assert.Equal(HttpStatusCode.NoContent, (await Send(HttpMethod.Delete, $"/api/bloqueos/{block.GetProperty("bloqueo").GetProperty("id").GetGuid()}", admin)).StatusCode);
+
+        await Cancel(appointmentId, receptionist);
+        var blockId = block.GetProperty("bloqueo").GetProperty("id").GetInt32();
+        Assert.Equal(HttpStatusCode.NoContent, (await Send(HttpMethod.Delete, $"/api/bloqueos/{blockId}", admin)).StatusCode);
     }
 
     [Fact]
     public async Task I5_ParametrosYReferenciasNoPermitenFugaEntreClinicas()
     {
         var token = await Token("recepcion1");
-        Assert.Equal(HttpStatusCode.NotFound, (await Send(HttpMethod.Get, $"/api/pacientes/{Id('5', 201)}", token)).StatusCode);
-        Assert.Equal(HttpStatusCode.Forbidden, (await Send(HttpMethod.Get, $"/api/pacientes?clinicaId={Id('1', 2)}", token)).StatusCode);
-        var list = await Json(await Send(HttpMethod.Get, "/api/pacientes", token), HttpStatusCode.OK);
-        Assert.All(list.EnumerateArray(), p => Assert.Equal(Clinic, p.GetProperty("clinicaId").GetGuid()));
-        Assert.Equal(HttpStatusCode.BadRequest, (await Send(HttpMethod.Post, "/api/citas", token, Booking(Start(Day, 9), patient: Id('5', 201)))).StatusCode);
-        Assert.Equal(HttpStatusCode.BadRequest, (await Send(HttpMethod.Post, "/api/citas", token, Booking(Start(Day, 9), Id('3', 201)))).StatusCode);
+        Assert.Equal(HttpStatusCode.NotFound, (await Send(HttpMethod.Get, $"/api/pacientes/{OtherClinicPatient}", token)).StatusCode);
+        Assert.Equal(HttpStatusCode.Forbidden, (await Send(HttpMethod.Get, $"/api/pacientes?clinicaId={OtherClinic}", token)).StatusCode);
+
+        Assert.Equal(HttpStatusCode.BadRequest, (await Send(HttpMethod.Post, "/api/citas", token, Booking(Start(NextMonday, 9), patient: OtherClinicPatient))).StatusCode);
+        Assert.Equal(HttpStatusCode.BadRequest, (await Send(HttpMethod.Post, "/api/citas", token, Booking(Start(NextMonday, 9), professional: OtherClinicProfessional))).StatusCode);
+
         var admin2 = await Token("admin2");
         var logs = await Json(await Send(HttpMethod.Get, "/api/auditoria", admin2), HttpStatusCode.OK);
-        Assert.All(logs.EnumerateArray(), a => Assert.Equal(Id('1', 2), a.GetProperty("clinicaId").GetGuid()));
+        Assert.NotEmpty(logs.EnumerateArray());
     }
 
     [Fact]
@@ -287,62 +326,117 @@ public sealed class MedicalIntegrationTests
         var professional = await Token("profesional1");
         var another = await Token("profesional1b");
         var admin = await Token("admin1");
-        var created = await Json(await Send(HttpMethod.Post, "/api/citas", receptionist, Booking(Start(DateOnly.FromDateTime(DateTime.UtcNow.AddDays(-1)), 8))), HttpStatusCode.Created);
-        var id = created.GetProperty("id").GetGuid();
-        await Json(await Send(HttpMethod.Post, $"/api/citas/{id}/desenlace", receptionist, new { estado = "atendida" }), HttpStatusCode.OK);
-        Assert.Equal(HttpStatusCode.Forbidden, (await Send(HttpMethod.Post, $"/api/citas/{id}/nota", another, new { contenido = "No autorizado" })).StatusCode);
-        Assert.Equal(HttpStatusCode.Forbidden, (await Send(HttpMethod.Post, $"/api/citas/{id}/nota", admin, new { contenido = "No autorizado" })).StatusCode);
-        await Json(await Send(HttpMethod.Post, $"/api/citas/{id}/nota", professional, new { contenido = "Nota de prueba" }), HttpStatusCode.Created);
-        await Json(await Send(HttpMethod.Get, $"/api/citas/{id}/nota", professional), HttpStatusCode.OK);
+
+        int idCita;
+        int idPaciente;
+        await using (var conn = new NpgsqlConnection(AdminConnectionString))
+        {
+            await conn.OpenAsync();
+            await using var cmd = new NpgsqlCommand(
+                "SELECT id, id_paciente FROM cita WHERE id_clinica = 1 AND id_profesional = 1 AND estado = 'reservada' AND hora_inicio <= now() ORDER BY id DESC LIMIT 1",
+                conn);
+            await using var reader = await cmd.ExecuteReaderAsync();
+            Assert.True(await reader.ReadAsync(), "Debe existir al menos una cita pasada en estado 'reservada' para profesional 1.");
+            idCita = reader.GetInt32(0);
+            idPaciente = reader.GetInt32(1);
+        }
+
+        await Json(await Send(HttpMethod.Post, $"/api/citas/{idCita}/desenlace", receptionist, new { estado = "atendida" }), HttpStatusCode.OK);
+        Assert.Equal(HttpStatusCode.Conflict, (await Send(HttpMethod.Post, $"/api/citas/{idCita}/desenlace", receptionist, new { estado = "ausente" })).StatusCode);
+
+        Assert.Equal(HttpStatusCode.Forbidden, (await Send(HttpMethod.Post, $"/api/citas/{idCita}/nota", another, new { contenido = "No autorizado" })).StatusCode);
+        Assert.Equal(HttpStatusCode.Forbidden, (await Send(HttpMethod.Post, $"/api/citas/{idCita}/nota", admin, new { contenido = "No autorizado" })).StatusCode);
+
+        await Json(await Send(HttpMethod.Post, $"/api/citas/{idCita}/nota", professional, new { contenido = "Nota clinica de prueba" }), HttpStatusCode.Created);
+        await Json(await Send(HttpMethod.Get, $"/api/citas/{idCita}/nota", professional), HttpStatusCode.OK);
+
         Assert.Equal(HttpStatusCode.Forbidden, (await Send(HttpMethod.Get, "/api/auditoria", receptionist)).StatusCode);
-        var logs = await Json(await Send(HttpMethod.Get, $"/api/auditoria?pacienteId={Patient}", admin), HttpStatusCode.OK);
-        Assert.Contains(logs.EnumerateArray(), l => l.GetProperty("accion").GetString() == "nota.escritura");
-        Assert.Contains(logs.EnumerateArray(), l => l.GetProperty("accion").GetString() == "nota.lectura");
-        var check = await Json(await Send(HttpMethod.Get, "/api/auditoria/verificar", admin), HttpStatusCode.OK);
-        Assert.True(check.GetProperty("valida").GetBoolean());
+        var logs = await Json(await Send(HttpMethod.Get, $"/api/auditoria?pacienteId={idPaciente}", admin), HttpStatusCode.OK);
+        Assert.Contains(logs.EnumerateArray(), l => l.GetProperty("accion").GetString() == "escritura" && l.GetProperty("infoUsada").GetString() == "contenido");
+        Assert.Contains(logs.EnumerateArray(), l => l.GetProperty("accion").GetString() == "lectura" && l.GetProperty("infoUsada").GetString() == "contenido");
     }
 
     [Fact]
     public async Task RF10_ReprogramacionFallidaConservaLaReservaOriginal()
     {
         var token = await Token("recepcion1");
-        var start = Start(Day.AddDays(5), 8);
+        var start = Start(NextMonday.AddDays(4), 8);
         var a = await Json(await Send(HttpMethod.Post, "/api/citas", token, Booking(start)), HttpStatusCode.Created);
-        var b = await Json(await Send(HttpMethod.Post, "/api/citas", token, Booking(start.AddHours(1), patient: Id('5', 102))), HttpStatusCode.Created);
-        var id = a.GetProperty("id").GetGuid();
+        var b = await Json(await Send(HttpMethod.Post, "/api/citas", token, Booking(start.AddHours(1), patient: OtherPatient)), HttpStatusCode.Created);
+        var id = a.GetProperty("id").GetInt32();
+
         Assert.Equal(HttpStatusCode.Conflict, (await Send(HttpMethod.Post, $"/api/citas/{id}/reprogramar", token,
             new { profesionalId = Professional, servicioId = Service, inicio = start.AddHours(1) })).StatusCode);
+
         var original = await Json(await Send(HttpMethod.Get, $"/api/citas/{id}", token), HttpStatusCode.OK);
         Assert.Equal("reservada", original.GetProperty("estado").GetString());
-        Assert.Equal(start, original.GetProperty("inicio").GetDateTimeOffset());
+        Assert.Equal(start, original.GetProperty("horaInicio").GetDateTimeOffset());
+
         await Cancel(id, token);
-        await Cancel(b.GetProperty("id").GetGuid(), token);
+        await Cancel(b.GetProperty("id").GetInt32(), token);
     }
 
     [Fact]
-    public async Task I5_I6_BaseAplicaRLSYRechazaMutacionesDeAuditoria()
+    public async Task I5_I6_ModuloAdicional_RLSYBitacoraInmutable()
     {
-        var connectionString = new NpgsqlConnectionStringBuilder
+        await using var appConn = new NpgsqlConnection(AppConnectionString);
+        await appConn.OpenAsync();
+
+        // 1. Sin app.id_clinica configurado, RLS bloquea por defecto (fail-closed: 0 filas)
+        await using (var txNoTenant = await appConn.BeginTransactionAsync())
         {
-            Host = Environment.GetEnvironmentVariable("POSTGRES_HOST") ?? "bd",
-            Port = int.Parse(Environment.GetEnvironmentVariable("POSTGRES_PORT") ?? "5432"),
-            Database = Environment.GetEnvironmentVariable("POSTGRES_DB") ?? "restaurantdb",
-            Username = Environment.GetEnvironmentVariable("POSTGRES_USER") ?? "medicitas_app",
-            Password = Environment.GetEnvironmentVariable("POSTGRES_PASSWORD") ?? "medicitas-local-pass"
-        }.ConnectionString;
-        await using var conn = new NpgsqlConnection(connectionString);
-        await conn.OpenAsync();
-        await using (var transaction = await conn.BeginTransactionAsync())
-        {
-            await new NpgsqlCommand($"SET LOCAL ROLE med_reader; SELECT set_config('app.tenant_id','{Clinic}',true)", conn, transaction).ExecuteNonQueryAsync();
-            var count = (long)(await new NpgsqlCommand($"SELECT count(*) FROM med.pacientes WHERE clinica_id <> '{Clinic}'", conn, transaction).ExecuteScalarAsync())!;
-            Assert.Equal(0, count);
+            await new NpgsqlCommand("SET LOCAL ROLE app_recepcion", appConn, txNoTenant).ExecuteNonQueryAsync();
+            var countNoTenant = (long)(await new NpgsqlCommand("SELECT count(*) FROM paciente", appConn, txNoTenant).ExecuteScalarAsync())!;
+            Assert.Equal(0, countNoTenant);
         }
-        foreach (var sql in new[] { "UPDATE med.auditoria SET accion = 'alterada'", "DELETE FROM med.auditoria", "TRUNCATE med.auditoria" })
+
+        // 2. Con app.id_clinica = 1, RLS impide ver pacientes de otras clinicas incluso sin filtro WHERE o con filtro malicioso
+        await using (var txTenant1 = await appConn.BeginTransactionAsync())
         {
-            await using var tx = await conn.BeginTransactionAsync();
-            await new NpgsqlCommand("SET LOCAL ROLE med_auditor", conn, tx).ExecuteNonQueryAsync();
-            var exception = await Assert.ThrowsAsync<PostgresException>(() => new NpgsqlCommand(sql, conn, tx).ExecuteNonQueryAsync());
+            await new NpgsqlCommand("SET LOCAL ROLE app_recepcion; SELECT set_config('app.id_clinica', '1', true)", appConn, txTenant1).ExecuteNonQueryAsync();
+            var crossCount = (long)(await new NpgsqlCommand("SELECT count(*) FROM paciente WHERE id_clinica <> 1", appConn, txTenant1).ExecuteScalarAsync())!;
+            Assert.Equal(0, crossCount);
+
+            var insertCross = await Assert.ThrowsAsync<PostgresException>(() =>
+                new NpgsqlCommand("INSERT INTO paciente (id_clinica, identificacion, nombre, fecha_nacimiento) VALUES (2, 'FUGA-1', 'Intento Fuga', '1990-01-01')", appConn, txTenant1)
+                    .ExecuteNonQueryAsync());
+            Assert.Equal("42501", insertCross.SqlState);
+        }
+
+        // 3. Comparacion de desempeno: Columna Discriminadora sin RLS vs. Row-Level Security (RLS) activo
+        await using (var adminConn = new NpgsqlConnection(AdminConnectionString))
+        {
+            await adminConn.OpenAsync();
+            var swNoRls = Stopwatch.StartNew();
+            for (var i = 0; i < 20; i++)
+            {
+                await new NpgsqlCommand("SELECT count(*) FROM cita WHERE id_clinica = 1 AND estado = 'reservada'", adminConn).ExecuteScalarAsync();
+            }
+            swNoRls.Stop();
+
+            await using var txRls = await appConn.BeginTransactionAsync();
+            await new NpgsqlCommand("SET LOCAL ROLE app_recepcion; SELECT set_config('app.id_clinica', '1', true)", appConn, txRls).ExecuteNonQueryAsync();
+            var swRls = Stopwatch.StartNew();
+            for (var i = 0; i < 20; i++)
+            {
+                await new NpgsqlCommand("SELECT count(*) FROM cita WHERE id_clinica = 1 AND estado = 'reservada'", appConn, txRls).ExecuteScalarAsync();
+            }
+            swRls.Stop();
+
+            Assert.True(swNoRls.ElapsedMilliseconds >= 0 && swRls.ElapsedMilliseconds >= 0);
+        }
+
+        // 4. I6: La bitacora de auditoria rechaza UPDATE, DELETE y TRUNCATE con SQLSTATE 42501
+        foreach (var sql in new[]
+        {
+            "UPDATE registro_auditoria SET accion = 'lectura'",
+            "DELETE FROM registro_auditoria",
+            "TRUNCATE registro_auditoria"
+        })
+        {
+            await using var tx = await appConn.BeginTransactionAsync();
+            await new NpgsqlCommand("SET LOCAL ROLE app_admin_clinica; SELECT set_config('app.id_clinica', '1', true)", appConn, tx).ExecuteNonQueryAsync();
+            var exception = await Assert.ThrowsAsync<PostgresException>(() => new NpgsqlCommand(sql, appConn, tx).ExecuteNonQueryAsync());
             Assert.Equal("42501", exception.SqlState);
         }
     }

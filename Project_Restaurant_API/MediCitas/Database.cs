@@ -79,37 +79,41 @@ public sealed class MedicalDatabase(IConfiguration config)
             {
                 await using var conn = new NpgsqlConnection(Connection(config, true));
                 await conn.OpenAsync();
-                await using var tx = await conn.BeginTransactionAsync();
-                await new NpgsqlCommand("SELECT pg_advisory_xact_lock(782375628)", conn, tx).ExecuteNonQueryAsync();
-
-                var schemaExists = (bool)(await new NpgsqlCommand(
-                    "SELECT to_regclass('public.clinica') IS NOT NULL", conn, tx).ExecuteScalarAsync())!;
-
-                if (!schemaExists)
+                await new NpgsqlCommand("SELECT pg_advisory_lock(782375628)", conn).ExecuteNonQueryAsync();
+                try
                 {
-                    var assembly = Assembly.GetExecutingAssembly();
-                    foreach (var resource in assembly.GetManifestResourceNames().Where(x => x.EndsWith(".sql")).Order())
-                    {
-                        using var stream = assembly.GetManifestResourceStream(resource)!;
-                        using var reader = new StreamReader(stream);
-                        var sql = await reader.ReadToEndAsync();
-                        await new NpgsqlCommand(sql, conn, tx) { CommandTimeout = 180 }.ExecuteNonQueryAsync();
-                    }
-                }
+                    var schemaExists = (bool)(await new NpgsqlCommand(
+                        "SELECT to_regclass('public.clinica') IS NOT NULL", conn).ExecuteScalarAsync())!;
 
-                var user = config["POSTGRES_USER"] ?? "medicitas_app";
-                if (user == (config["DB_BOOTSTRAP_USER"] ?? "postgres"))
-                    throw new InvalidOperationException("La aplicacion requiere un usuario distinto del administrador de PostgreSQL.");
-                var password = config["POSTGRES_PASSWORD"];
-                if (string.IsNullOrWhiteSpace(password)) throw new InvalidOperationException("POSTGRES_PASSWORD es obligatorio.");
-                await using var exists = new NpgsqlCommand("SELECT EXISTS(SELECT FROM pg_roles WHERE rolname = @user)", conn, tx);
-                exists.Parameters.AddWithValue("user", user);
-                var operation = (bool)(await exists.ExecuteScalarAsync())! ? "ALTER" : "CREATE";
-                var identifier = new NpgsqlCommandBuilder().QuoteIdentifier(user);
-                var literal = "'" + password.Replace("'", "''") + "'";
-                await new NpgsqlCommand($"{operation} ROLE {identifier} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS PASSWORD {literal}", conn, tx).ExecuteNonQueryAsync();
-                await new NpgsqlCommand($"GRANT app_plataforma, app_medicitas, app_admin_clinica, app_recepcion, app_profesional TO {identifier}", conn, tx).ExecuteNonQueryAsync();
-                await tx.CommitAsync();
+                    if (!schemaExists)
+                    {
+                        var assembly = Assembly.GetExecutingAssembly();
+                        foreach (var resource in assembly.GetManifestResourceNames().Where(x => x.EndsWith(".sql")).Order())
+                        {
+                            using var stream = assembly.GetManifestResourceStream(resource)!;
+                            using var reader = new StreamReader(stream);
+                            var sql = await reader.ReadToEndAsync();
+                            await new NpgsqlCommand(sql, conn) { CommandTimeout = 300 }.ExecuteNonQueryAsync();
+                        }
+                    }
+
+                    var user = config["POSTGRES_USER"] ?? "medicitas_app";
+                    if (user == (config["DB_BOOTSTRAP_USER"] ?? "postgres"))
+                        throw new InvalidOperationException("La aplicacion requiere un usuario distinto del administrador de PostgreSQL.");
+                    var password = config["POSTGRES_PASSWORD"];
+                    if (string.IsNullOrWhiteSpace(password)) throw new InvalidOperationException("POSTGRES_PASSWORD es obligatorio.");
+                    await using var exists = new NpgsqlCommand("SELECT EXISTS(SELECT FROM pg_roles WHERE rolname = @user)", conn);
+                    exists.Parameters.AddWithValue("user", user);
+                    var operation = (bool)(await exists.ExecuteScalarAsync())! ? "ALTER" : "CREATE";
+                    var identifier = new NpgsqlCommandBuilder().QuoteIdentifier(user);
+                    var literal = "'" + password.Replace("'", "''") + "'";
+                    await new NpgsqlCommand($"{operation} ROLE {identifier} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS PASSWORD {literal}", conn).ExecuteNonQueryAsync();
+                    await new NpgsqlCommand($"GRANT app_plataforma, app_medicitas, app_admin_clinica, app_recepcion, app_profesional TO {identifier}", conn).ExecuteNonQueryAsync();
+                }
+                finally
+                {
+                    await new NpgsqlCommand("SELECT pg_advisory_unlock(782375628)", conn).ExecuteNonQueryAsync();
+                }
                 return;
             }
             catch (NpgsqlException ex) when (attempt < 29 && ex.IsTransient)

@@ -9,6 +9,8 @@ services:
     volumes:
     - postgres_data:/var/lib/postgresql/data
     - ./db/init:/docker-entrypoint-initdb.d:ro
+    ports:
+    - ${PG_PORT:-5432}:5432
     healthcheck:
       test:
       - CMD-SHELL

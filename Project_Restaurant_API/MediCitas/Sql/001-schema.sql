@@ -3253,12 +3253,12 @@ BEGIN
 
         OPEN OutCursor FOR
             WITH espacios AS (
-                SELECT (InFecha + g.t) AT TIME ZONE vZona AS hora_inicio,
-                       ((InFecha + g.t) AT TIME ZONE vZona) + make_interval(mins => vDuracion) AS hora_fin
+                SELECT (g.t AT TIME ZONE vZona) AS hora_inicio,
+                       (g.t AT TIME ZONE vZona) + make_interval(mins => vDuracion) AS hora_fin
                 FROM horario_atencion h
                 CROSS JOIN LATERAL generate_series(
-                    h.hora_inicio,
-                    h.hora_fin - make_interval(mins => vDuracion),
+                    InFecha + h.hora_inicio,
+                    InFecha + h.hora_fin - make_interval(mins => vDuracion),
                     make_interval(mins => vDuracion)) AS g(t)
                 WHERE h.id_clinica = app_id_clinica()
                   AND h.id_profesional = InIdProfesional

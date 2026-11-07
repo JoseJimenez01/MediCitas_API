@@ -539,12 +539,12 @@ WITH choque AS (
 )
 UPDATE c_est e SET estado = 'cancelada' FROM choque c WHERE c.slot_id = e.slot_id;
 
--- dejar las 2 citas pasadas mas recientes del profesional 1 (clinica 1) en estado 'reservada' para pruebas de RF12 y RF15
+-- dejar las 10 citas pasadas mas recientes del profesional 1 (clinica 1) en estado 'reservada' para pruebas de RF12 y RF15
 UPDATE c_est SET estado = 'reservada'
 WHERE slot_id IN (
     SELECT slot_id FROM c_est
     WHERE id_clinica = 1 AND id_profesional = 1 AND fin <= now() AND NOT es_origen AND estado = 'atendida'
-    ORDER BY inicio DESC LIMIT 2
+    ORDER BY inicio DESC LIMIT 10
 );
 
 CREATE TEMP TABLE cita_final AS
