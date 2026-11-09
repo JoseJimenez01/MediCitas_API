@@ -1,11 +1,11 @@
 # MediCitas API — Servicio HTTP contenerizado con Docker Compose
 
-Servicio REST de **reservas de mesa** en **ASP.NET Core 8** con persistencia en
-**PostgreSQL**, autenticación delegada en **Keycloak** (JWT/OIDC, sin login propio) y
+Servicio REST de **gestión de citas médicas multi-clínica** en **ASP.NET Core 8** con persistencia en
+**PostgreSQL**, caché de disponibilidad en **Redis**, autenticación delegada en **Keycloak** (JWT/OIDC, sin login propio) y
 orquestación completa con **Docker Compose**.
 
 El sistema completo se levanta con **un solo comando** y queda operativo sin pasos
-manuales: el esquema se crea solo, el realm de Keycloak se importa solo y los healthchecks
+manuales: el esquema y la semilla se cargan solos, el realm de Keycloak se importa solo y los healthchecks
 ordenan el arranque.
 
 ```
@@ -14,19 +14,28 @@ ordenan el arranque.
 │   ┌──────────────┐   por nombre de servicio   ┌─────────────────────┐  │
 │   │  api (app)   │ ◄────────────────────────► │  bd (PostgreSQL 16) │  │
 │   │ :8080        │   bd:5432 (restaurantdb)   │ :5432  + volumen    │  │
-│   └──────┬───────┘                            └─────────────────────┘  │
-│          │ por nombre de servicio                                      │
-│          │ auth:8080 (OIDC: validación de JWT)                         │
-│          ▼                                                             │
+│   └──┬────────┬──┘                            └─────────────────────┘  │
+│      │        │ por nombre de servicio                                 │
+│      │        │ redis:6379 (caché de disponibilidad RF7)               │
+│      │        ▼                                                        │
+│      │   ┌─────────────────────┐                                       │
+│      │   │  redis (Redis 7.4)  │                                       │
+│      │   │ :6379               │                                       │
+│      │   └─────────────────────┘                                       │
+│      │ por nombre de servicio                                          │
+│      │ auth:8080 (OIDC: validación de JWT)                             │
+│      ▼                                                                 │
 │   ┌─────────────────────┐                                              │
 │   │  auth (Keycloak 26) │  realm restaurant (importado al arrancar)    │
-│   │ :8080 (host:8081)   │  client restaurant-api, rol api-writer       │
+│   │ :8080 (host:8081)   │  client restaurant-api                       │
 │   └─────────────────────┘                                              │
 └────────────────────────────────────────────────────────────────────────┘
 ```
 
 **Puertos publicados al host:** API en `http://localhost:8080`, Keycloak en
-`http://localhost:8081`.
+`http://localhost:8081`, PostgreSQL en `localhost:5432`.
+
+Documentación complementaria en [`docs/DISENO.md`](docs/DISENO.md) y [`docs/PRUEBAS.md`](docs/PRUEBAS.md).
 
 ---
 
@@ -34,15 +43,14 @@ ordenan el arranque.
 
 - **Docker** con el plugin **Docker Compose** (v2).
 - Ningún otro requisito para el arranque: la imagen del servicio se construye desde el
-  repositorio y las imágenes oficiales (`postgres`, `keycloak`) se descargan solas.
-- Para **correr las pruebas** se necesita además el **.NET SDK 8** en la máquina
-  (`dotnet test`), o bien ejecutarlas con el contenedor del SDK (sección 4).
+  repositorio y las imágenes oficiales (`postgres`, `redis`, `keycloak`) se descargan solas.
+- Para **correr las pruebas** se puede usar directamente la etapa `tests` del `Dockerfile` o el **.NET SDK 8** local (sección 5).
 
 ---
 
 ## 2. Diseño de la base de datos
 
-El diseño está en PostgreSQL 15+ y se instala con un solo script: `001-schema.sql`.
+El diseño está en PostgreSQL 15+ y se instala con `001-schema.sql` junto con los datos semilla en `002-seed.sql`. El detalle del diccionario de datos y planes de ejecución está en [`docs/DISENO.md`](docs/DISENO.md).
 
 **Diseño de la base de datos**
 
@@ -70,11 +78,10 @@ Cada clínica es un tenant y sus datos no deben ser accesibles desde otra. Hay t
 
 El módulo adicional implementado es el Row-Level Security:
 
-- El backend fija el tenant al inicio de cada transacción: `SELECT set_config('app.id_clinica', '<id>', TRUE);`, tomado del token ya validado.
+- El backend fija el tenant y el rol al inicio de cada transacción: `SET LOCAL ROLE <rol>; SELECT set_config('app.id_clinica', '<id>', TRUE);`, tomados del token ya validado.
 - Todas las tablas con `id_clinica` (más `usuario` y `clinica`) tienen RLS activado y forzado, con una política que exige `id_clinica = app_id_clinica()` al leer y al escribir. Sin contexto definido no se ve ni se escribe ninguna fila.
-- Hay dos roles: `app_medicitas` (operación normal, sujeto a RLS) y `app_plataforma` (solo alta de clínicas y usuarios, sin acceso a datos clínicos).
+- Se definen roles de base de datos con menor privilegio alineados a la matriz (`app_plataforma`, `app_admin_clinica`, `app_recepcion`, `app_profesional`, agrupados en `app_medicitas`).
 - La bitácora `registro_auditoria` solo admite `INSERT` y `SELECT`.
-- El aislamiento es solo por clínica; los permisos por rol dentro de una clínica los aplica el backend.
 
 **Transacciones mediante procedimientos almacenados**
 
@@ -85,8 +92,9 @@ Todas las operaciones se realizan llamando a los procedimientos almacenados (`SP
 
 ```sql
 BEGIN;
-SELECT set_config('app.id_clinica', '42', TRUE);
-CALL SP_ReservarCita('rec01', 10, 3, 2, '2026-11-02 09:00-06', NULL, NULL);  -- (outidcita, outresult)
+SET LOCAL ROLE app_recepcion;
+SELECT set_config('app.id_clinica', '1', TRUE);
+CALL SP_ReservarCita('recepcion1', 1, 1, 1, '2026-11-23 09:00-06', NULL, NULL);  -- (outidcita, outresult)
 COMMIT;
 ```
 
@@ -118,183 +126,128 @@ cp .env.example .env     # y ajustar valores si se desea (los de ejemplo funcion
 **Arrancar el sistema completo:**
 
 ```bash
-docker compose up -d
+docker compose up -d --build
 ```
 
 Este único comando:
 
-1. crea la red, el **volumen** de PostgreSQL (`postgres_data`) y los tres servicios;
-2. inicia **PostgreSQL** y espera a que esté sano (`pg_isready`);
+1. crea la red, el **volumen** de PostgreSQL (`postgres_data`) y los cuatro servicios (`bd`, `redis`, `auth`, `api`);
+2. inicia **PostgreSQL** y **Redis** y espera a que estén sanos;
 3. inicializa la base `keycloakdb` (script `db/init`) e inicia **Keycloak**, que importa
    el realm versionado `keycloak/realm-export.json` (`--import-realm`);
-4. recién cuando sus dependencias están sanas, inicia la **API**, que crea la tabla
-   `reservas` por código de arranque (con reintentos) y arranca escuchando en `:8080`.
+4. cuando sus dependencias están sanas, inicia la **API**, que carga `001-schema.sql` y `002-seed.sql`
+   si la base está vacía y arranca escuchando en `:8080`.
 
 **Verificar que el sistema quedó arriba y sano:**
 
 ```bash
-docker compose ps          # los tres servicios en estado "healthy"
+docker compose ps          # los cuatro servicios en estado "healthy"
 curl -s http://localhost:8080/health   # {"status":"healthy"} -> 200
-curl -s http://localhost:8080/ready    # {"status":"ready"}    -> 200
+curl -s http://localhost:8080/ready    # {"status":"ready"}   -> 200
 ```
 
 > `/health` responde **sin tocar la base** (liveness). `/ready` comprueba la conexión a
-> PostgreSQL (readiness): `200` si la base acepta consultas, `503` si no.
+> PostgreSQL y Redis (readiness): `200` si responden, `503` si no.
 
-**Probar un ciclo completo sin token y con token** en el que la app misma valida la firma
-contra Keycloak, en 6 comandos:
+**Probar un ciclo con y sin token** validando la firma contra Keycloak:
 
 ```bash
 # 1. Sin token -> 401
-curl -s -o /dev/null -w "%{http_code}\n" -X POST http://localhost:8080/reservas \
-  -H "Content-Type: application/json" \
-  -d '{"nombreCliente":"Ana","fecha":"2026-08-20","hora":"19:30:00","cantidadPersonas":4}'
+curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8080/api/pacientes
 
-# 2. Obtener token del usuario "escritor" (delegado a Keycloak)
+# 2. Obtener token del usuario "recepcion1" (Clínica 1, contraseña por defecto MediCitas123!)
 TOKEN=$(curl -s -X POST http://localhost:8081/realms/restaurant/protocol/openid-connect/token \
   -d "grant_type=password" -d "client_id=restaurant-api" \
-  -d "username=escritor" -d "password=escritor-pass" \
+  -d "username=recepcion1" -d "password=MediCitas123!" \
   | python3 -c "import sys,json;print(json.load(sys.stdin)['access_token'])")
 
-# 3. Crear con token -> 201
-curl -s -w "\n%{http_code}\n" -X POST http://localhost:8080/reservas \
-  -H "Content-Type: application/json" -H "Authorization: Bearer $TOKEN" \
-  -d '{"nombreCliente":"Ana Rodriguez","fecha":"2026-08-20","hora":"19:30:00","cantidadPersonas":4}'
+# 3. Consultar identidad y pacientes de la clínica -> 200
+curl -s -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/yo
+curl -s -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/pacientes
 
-# 4. Listar -> 200 y refleja lo escrito
-curl -s http://localhost:8080/reservas
+# 4. Consultar disponibilidad (RF7, caché en Redis) -> 200
+curl -s -H "Authorization: Bearer $TOKEN" \
+  "http://localhost:8080/api/disponibilidad?profesionalId=1&servicioId=1&fecha=2026-11-23"
 
-# 5. Token del usuario "lector" (SIN el rol) -> 403
-TOKEN2=$(curl -s -X POST http://localhost:8081/realms/restaurant/protocol/openid-connect/token \
-  -d "grant_type=password" -d "client_id=restaurant-api" \
-  -d "username=lector" -d "password=lector-pass" \
-  | python3 -c "import sys,json;print(json.load(sys.stdin)['access_token'])")
-
-curl -s -o /dev/null -w "%{http_code}\n" -X POST http://localhost:8080/reservas \
-  -H "Content-Type: application/json" -H "Authorization: Bearer $TOKEN2" \
-  -d '{"nombreCliente":"X","fecha":"2026-08-20","hora":"19:30:00","cantidadPersonas":2}'
+# 5. Operación no permitida para recepción (consultar auditoría RF19) -> 403
+curl -s -o /dev/null -w "%{http_code}\n" \
+  -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/auditoria
 ```
 
 ---
 
 ## 4. Contrato de rutas
 
-### Salud y disponibilidad (siempre abiertas, sin token)
+### Salud y disponibilidad (abiertas, sin token)
 
 | Método | Ruta | Descripción | Respuesta |
 |---|---|---|---|
 | `GET` | `/health` | **Liveness**. No toca la base de datos. | `200` `{"status":"healthy"}` |
-| `GET` | `/ready` | **Readiness**. Verifica la conexión a PostgreSQL. | `200` `{"status":"ready"}` o `503` |
+| `GET` | `/ready` | **Readiness**. Verifica la conexión a PostgreSQL y Redis. | `200` `{"status":"ready"}` o `503` |
 
-### Reservas (recurso)
+### Rutas del dominio MediCitas (`/api/*`, requieren JWT Bearer)
 
-| Método | Ruta | Auth | Descripción | Respuestas |
+| Método | Ruta | Roles permitidos | Requisito | Respuestas |
 |---|---|---|---|---|
-| `GET` | `/reservas` | pública | Lista todo. Admite filtro `?fecha=YYYY-MM-DD` | `200` `[ ... ]` |
-| `GET` | `/reservas/{id}` | pública | Consulta por identificador | `200` / `404` |
-| `POST` | `/reservas` | **rol requerido** | Crea una reserva | `201` / `400` / `401` / `403` |
-| `PUT` | `/reservas/{id}` | **rol requerido** | Actualiza una reserva | `200` / `400` / `404` / `401` / `403` |
-| `DELETE` | `/reservas/{id}` | **rol requerido** | Elimina una reserva | `204` / `404` / `401` / `403` |
-
-> **Decisión documentada:** las **lecturas** (`GET`) quedan **públicas** y solo las
-> **escrituras** (`POST`/`PUT`/`DELETE`) exigen token con el rol requerido. La spec deja
-> esta decisión a criterio del grupo; aquí se eligió exponer el listado y la consulta sin
-> autenticación y proteger únicamente las modificaciones.
-
-### Cuerpo de una reserva y validación
-
-```json
-{
-  "nombreCliente": "Ana Rodriguez",
-  "fecha": "2026-08-20",
-  "hora": "19:30:00",
-  "cantidadPersonas": 4
-}
-```
-
-- `nombreCliente`: obligatorio, máx. 120 caracteres.
-- `fecha`: obligatoria, formato `yyyy-MM-dd`.
-- `hora`: obligatoria, formato `HH:mm:ss`.
-- `cantidadPersonas`: obligatorio, entero entre 1 y 50.
-
-Cuerpo inválido o incompleto → **`400`** (RFC 7807, con el detalle por campo). Un recurso
-inexistente → **`404`**. Ninguna de estas situaciones tumba el proceso: el servicio se
-mantiene operativo (`/health` sigue en `200`).
+| `GET` | `/api/yo` | Todos los roles | `RF17` | `200` / `401` / `403` |
+| `POST` | `/api/clinicas` | `platform-admin` | `RF1` | `201` / `400` / `403` / `409` |
+| `GET` | `/api/usuarios` | `clinic-admin` | `RF2` | `200` / `403` |
+| `POST` | `/api/usuarios` | `clinic-admin` | `RF2` | `201` / `400` / `403` / `409` |
+| `PUT` | `/api/usuarios/{id}` | `clinic-admin` | `RF2` | `200` / `400` / `404` |
+| `DELETE` | `/api/usuarios/{id}` | `clinic-admin` | `RF2` | `204` / `404` |
+| `GET` | `/api/servicios` | `clinic-admin`, `reception`, `professional` | `RF3` | `200` |
+| `POST` | `/api/servicios` | `clinic-admin` | `RF3` | `201` / `400` / `409` |
+| `PUT` | `/api/servicios/{id}` | `clinic-admin` | `RF3`, `I8` | `200` / `400` / `404` |
+| `GET` | `/api/profesionales` | `clinic-admin`, `reception`, `professional` | `RF4` | `200` |
+| `POST` | `/api/profesionales` | `clinic-admin` | `RF4` | `201` / `400` / `409` |
+| `PUT` | `/api/profesionales/{id}` | `clinic-admin` | `RF4`, `I8` | `200` / `400` / `404` |
+| `GET` | `/api/profesionales/{id}/horarios` | `clinic-admin`, `reception`, `professional` | `RF5` | `200` / `403` |
+| `POST` | `/api/profesionales/{id}/horarios` | `clinic-admin` | `RF5`, `I8` | `201` / `400` / `409` |
+| `DELETE` | `/api/horarios/{id}` | `clinic-admin` | `RF5`, `I8` | `204` / `404` |
+| `GET` | `/api/profesionales/{id}/bloqueos` | `clinic-admin`, `reception`, `professional` | `RF6` | `200` / `403` |
+| `POST` | `/api/profesionales/{id}/bloqueos` | `clinic-admin` | `RF6`, `I8` | `201` / `400` |
+| `DELETE` | `/api/bloqueos/{id}` | `clinic-admin` | `RF6`, `I8` | `204` / `404` |
+| `GET` | `/api/disponibilidad` | `clinic-admin`, `reception`, `professional` | `RF7`, `I8` | `200` / `400` / `404` |
+| `GET` | `/api/disponibilidad/servicios/{servicioId}` | `clinic-admin`, `reception` | `RF8` | `200` / `400` / `404` |
+| `GET` | `/api/pacientes` | `clinic-admin`, `reception`, `professional` | `RF14`, `I5` | `200` / `403` |
+| `GET` | `/api/pacientes/{id}` | `clinic-admin`, `reception`, `professional` | `RF14`, `RF18` | `200` / `404` |
+| `POST` | `/api/pacientes` | `clinic-admin`, `reception` | `RF14`, `RF18` | `201` / `400` / `409` |
+| `PUT` | `/api/pacientes/{id}` | `clinic-admin`, `reception` | `RF14`, `RF18` | `200` / `400` / `404` |
+| `GET` | `/api/pacientes/{id}/historial` | `clinic-admin`, `reception`, `professional` | `RF14` | `200` |
+| `POST` | `/api/citas` | `clinic-admin`, `reception` | `RF9`, `I1`–`I4`, `I7`, `I8` | `201` / `400` / `409` |
+| `GET` | `/api/citas/{id}` | `clinic-admin`, `reception`, `professional` | `RF9`, `RF16` | `200` / `403` / `404` |
+| `POST` | `/api/citas/{id}/reprogramar` | `clinic-admin`, `reception` | `RF10`, `I1`–`I4`, `I8` | `200` / `400` / `409` |
+| `POST` | `/api/citas/{id}/cancelar` | `clinic-admin`, `reception` | `RF11`, `RF13`, `I8` | `200` / `400` / `409` |
+| `POST` | `/api/citas/{id}/desenlace` | `clinic-admin`, `reception`, `professional` | `RF12`, `RF13`, `I8` | `200` / `400` / `403` / `409` |
+| `POST` | `/api/citas/{id}/nota` | `professional` (autor de la cita) | `RF15`, `RF18` | `201` / `400` / `403` / `409` |
+| `GET` | `/api/citas/{id}/nota` | `professional` | `RF15`, `RF18` | `200` / `404` |
+| `GET` | `/api/agenda` | `clinic-admin`, `reception`, `professional` | `RF16` | `200` / `400` / `403` |
+| `GET` | `/api/estadisticas/citas` | `clinic-admin`, `reception` | `RF20` | `200` / `400` |
+| `GET` | `/api/auditoria` | `clinic-admin` | `RF19` | `200` / `403` |
 
 ---
 
 ## 5. Pruebas (unitarias + integración)
 
-Con la pila arriba (`docker compose up -d`), exportar la configuración y correr **todas**
-las pruebas con un solo comando:
+Con la pila arriba (`docker compose up -d`), correr **todas** las pruebas con un solo comando:
 
 ```bash
-export TEST_API_BASE_URL=http://localhost:8080
-export TEST_KEYCLOAK_TOKEN_URL=http://localhost:8081/realms/restaurant/protocol/openid-connect/token
-export TEST_CLIENT_ID=restaurant-api
-export TEST_CLIENT_SECRET=            # el client es público, no requiere secret
-export TEST_USERNAME=escritor        TEST_PASSWORD=escritor-pass
-export TEST_USERNAME_NOROLE=lector   TEST_PASSWORD_NOROLE=lector-pass
+docker build --target tests -t medicitas-tests . && docker run --rm --network host medicitas-tests
+```
 
+O con el SDK de .NET 8 instalado localmente:
+
+```bash
 dotnet test Project_Restaurant_API.Tests/Project_Restaurant_API.Tests.csproj
 ```
 
-Esperado: **28 passed** (20 unitarias + 8 integración).
+Esperado: **33 passed** (unitarias + integración). El detalle de qué prueba cubre cada requisito funcional e invariante está en [`docs/PRUEBAS.md`](docs/PRUEBAS.md).
 
-**Solo unitarias** (sin Docker, PostgreSQL ni Keycloak):
-
-```bash
-dotnet test Project_Restaurant_API.Tests/Project_Restaurant_API.Tests.csproj \
-  --filter "FullyQualifiedName~Unit"
-```
-
-Esperado: **20 passed** (validación de campos, límites 1–50 y mapeo DTO↔entidad).
-
-**Sin .NET SDK local:** se pueden correr dentro del contenedor oficial del SDK,
-apuntando a la pila levantada:
+**Solo unitarias** (sin requerir contenedores activos):
 
 ```bash
-docker run --rm --network host -v "$PWD":/work -w /work \
-  -e TEST_API_BASE_URL=http://localhost:8080 \
-  -e TEST_KEYCLOAK_TOKEN_URL=http://localhost:8081/realms/restaurant/protocol/openid-connect/token \
-  -e TEST_CLIENT_ID=restaurant-api \
-  -mcr.microsoft.com/dotnet/sdk:8.0 \
-  dotnet test Project_Restaurant_API.Tests/Project_Restaurant_API.Tests.csproj
+docker run --rm --network host medicitas-tests --filter "FullyQualifiedName~Unit"
 ```
-
-**Variables de las pruebas** (valores por defecto entre paréntesis):
-
-| Variable | Descripción |
-|---|---|
-| `TEST_API_BASE_URL` | URL de la API (`http://localhost:8080`) |
-| `TEST_KEYCLOAK_TOKEN_URL` | Endpoint de token de Keycloak (puerto `8081`) |
-| `TEST_CLIENT_ID` / `TEST_CLIENT_SECRET` | Client para pedir tokens (público → sin secret) |
-| `TEST_USERNAME` / `TEST_PASSWORD` | Usuario **con** el rol (`escritor`) |
-| `TEST_USERNAME_NOROLE` / `TEST_PASSWORD_NOROLE` | Usuario **sin** el rol (`lector`) |
-
-Cobertura de las pruebas de integración (`Project_Restaurant_API.Tests/Integration`):
-
-| Prueba | Qué verifica |
-|---|---|
-| `Health_Responde200_SinTocarLaBase` | liveness abierto |
-| `Ready_Responde200_CuandoPostgresAceptaConsultas` | readiness contra la BD |
-| `CicloCRUD_Completo_ConPersistencia` | 401 → 201 → listar → filtrar → 200 → PUT 200 → DELETE 204 → 404 |
-| `Crear_CuerpoInvalido_Responde400` | validación de entrada |
-| `Consultar_IdInexistente_Responde404` | recurso inexistente |
-| `Escribir_SinToken_Responde401` | autenticación requerida |
-| `Escribir_TokenSinRol_Responde403` | rol requerido |
-| `Salud_Y_Disponibilidad_QuedanAbiertas_SinToken` | health/ready abiertas |
-
-**Pruebas k6 end-to-end (Compose):** la pila incluye además un perfil opcional de pruebas
-con **k6** que recorre el mismo contrato (401/403/400/201/200/filtro/404, PUT y DELETE)
-y la persistencia, con comandos documentados:
-
-```bash
-./scripts/run-compose-integration.sh     # contrato completo con k6 en la red de Compose
-./scripts/run-compose-persistence.sh     # escribe, reinicia, verifica y limpia (k6)
-```
-
-Requieren las variables `K6_*` en `.env` (ver sección 7).
 
 ---
 
@@ -303,19 +256,14 @@ Requieren las variables `K6_*` en `.env` (ver sección 7).
 Los datos viven en el **volumen** `postgres_data`, no en la app:
 
 ```bash
-# 1. Escribir un registro (con token)
-curl -s -X POST http://localhost:8080/reservas \
-  -H "Content-Type: application/json" -H "Authorization: Bearer $TOKEN" \
-  -d '{"nombreCliente":"Persistencia","fecha":"2026-12-24","hora":"13:00:00","cantidadPersonas":8}'
-
-# 2. Bajar el sistema SIN borrar volúmenes
+# 1. Bajar el sistema SIN borrar volúmenes
 docker compose down
 
-# 3. Volver a levantar
+# 2. Volver a levantar
 docker compose up -d
 
-# 4. Leer los mismos datos (mismo id, misma fila)
-curl -s "http://localhost:8080/reservas?fecha=2026-12-24"
+# 3. Verificar que las clínicas y pacientes siguen presentes
+curl -s -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/pacientes
 ```
 
 > Usar `docker compose down` **sin** la bandera `-v`. Con `-v` se borra el volumen y los
@@ -340,60 +288,33 @@ La imagen y el código **no contienen secretos**. Todo se inyecta por entorno us
 
 | Variable | Descripción | Ejemplo |
 |---|---|---|
-| `API_PORT` / `KC_PORT` | Puertos publicados al host de la API y de Keycloak | `8080` / `8081` |
-| `TAG_PG` | Tag de la imagen `postgres` | `16-alpine` |
-| `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | Credenciales y base de la app | `postgres` / `secretodesk` / `restaurantdb` |
-| `TAG_KC` | Tag de la imagen de Keycloak | `26.0` |
-| `KC_BOOTSTRAP_ADMIN_USERNAME` / `KC_BOOTSTRAP_ADMIN_PASSWORD` | Admin del realm `master` (solo bootstrap) | `admin` / `admin` |
-| `KC_HEALTH_ENABLED` / `KC_METRICS_ENABLED` | Health/metrías de Keycloak (endpoint 9000) | `true` |
-| `KC_DB` / `KC_DB_URL` | Motor y JDBC de Keycloak (su propia base) | `postgres` / `jdbc:postgresql://bd:5432/keycloakdb` |
-| `KC_CACHE` / `KC_HTTP_ENABLED` / `KC_HOSTNAME_STRICT` | Dev local de Keycloak | `local` / `true` / `false` |
-| `KEYCLOAK_REALM` | Realm importado | `restaurant` |
-| `KEYCLOAK_AUTHORITY` | Issuer para descubrimiento OIDC, **por nombre de servicio** | `http://auth:8080/realms/restaurant` |
-| `KEYCLOAK_VALID_ISSUER` | Issuer real que ponen los tokens emitidos por `localhost:KC_PORT` | `http://localhost:8081/realms/restaurant` |
-| `KEYCLOAK_REQUIRED_ROLE` | Rol exigido para escribir | `api-writer` |
-| `KEYCLOAK_AUDIENCE` | (opcional) Audiencia esperada del token | — |
-
-La cadena de conexión de la app se arma a partir de `POSTGRES_*` en `Program.cs`
-(`Host=bd`, `Port=5432`, `Database=...`, `Username=...`, `Password=...`).
+| `API_PORT` / `KC_PORT` / `PG_PORT` | Puertos publicados al host de la API, Keycloak y PostgreSQL | `8080` / `8081` / `5432` |
+| `TAG_PG` / `TAG_KC` | Tags de las imágenes `postgres` y `keycloak` | `16-alpine` / `26.0.8` |
+| `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | Credenciales de bootstrap y base de datos | `postgres` / `secretodesk` / `restaurantdb` |
+| `APP_DB_USER` / `APP_DB_PASSWORD` | Usuario de aplicación sin privilegios de superusuario | `medicitas_app` / `medicitas-local-pass` |
+| `REDIS_CONNECTION` | Endpoint de Redis en la red de Compose | `redis:6379` |
+| `KC_BOOTSTRAP_ADMIN_USERNAME` / `KC_BOOTSTRAP_ADMIN_PASSWORD` | Admin del realm `master` | `admin` / `admin` |
+| `KEYCLOAK_AUTHORITY` / `KEYCLOAK_VALID_ISSUER` | Emisor OIDC por nombre de servicio | `http://auth:8080/realms/restaurant` |
+| `MED_TEST_PASSWORD` | Contraseña de los usuarios de prueba en Keycloak | `MediCitas123!` |
+| `MED_ADMIN_CLIENT_SECRET` | Secret del cliente de aprovisionamiento en Keycloak | `medicitas-provisioning-local` |
 
 ---
 
 ## 9. Autenticación con Keycloak
 
 - El servicio **no** implementa login ni firma de tokens; solo **valida** los JWT que
-  recibe contra el proveedor (OIDC discovery + llaves públicas de Keycloak,
-  `AddJwtBearer` + `options.Authority`).
+  recibe contra el proveedor (`AddJwtBearer` + `options.Authority`).
 - El realm `restaurant` está versionado en `keycloak/realm-export.json` y se importa al
-  arrancar Keycloak (`command: start-dev --import-realm`). Contiene:
-  - **client** `restaurant-api`: público con *Direct Access Grants* (permite el flujo
-    `grant_type=password` de las pruebas y de la sección 2, sin secret).
-  - **rol** de realm `api-writer`.
-  - **usuarios** `escritor` / `escritor-pass` (con el rol) y `lector` / `lector-pass`
-    (sin el rol, solo roles por defecto).
-- `POST`/`PUT`/`DELETE` exigen la política `Escritura` (`RequireRole(KEYCLOAK_REQUIRED_ROLE)`).
-- El rol llega en el claim `realm_access.roles`; `Auth/KeycloakClaimsTransformation.cs` lo
-  extrae y lo expone como `ClaimTypes.Role` para que ASP.NET lo evalúe.
-- Resultados: sin token o token inválido → **401**; token válido **sin** el rol → **403**;
-  `secretodesk`-less y con el rol → operación permitida.
-
-> **Por qué dos "issuers":** dentro de la red de Compose la app solo puede alcanzar a
-> Keycloak por `http://auth:8080`, y así descubre las llaves públicas. Los tokens que
-> emite el proveedor cuando un cliente humano lo contacta por `http://localhost:8081`
-> llevan ese host en su `iss`. Como esa parte del `iss` depende de cómo se contacta al
-> servicio, se fija explícitamente con `KEYCLOAK_VALID_ISSUER`. El código lo soporta
-> (opcional en `.env`), y la validación de firma siempre se hace contra las llaves que
-> publica `http://auth:8080/realms/restaurant`.
+  arrancar Keycloak (`start-dev --import-realm`). Contiene los roles `platform-admin`, `clinic-admin`, `reception` y `professional`, junto con los usuarios de prueba (`plataforma`, `admin1..3`, `recepcion1..3`, `profesional1..3`, `profesional1b..3b`).
+- El rol llega en `realm_access.roles`; `Auth/KeycloakClaimsTransformation.cs` lo
+  extrae y lo expone como `ClaimTypes.Role`.
+- A partir del claim `sub`, la API resuelve el usuario y su `id_clinica` en PostgreSQL (`SP_ResolverIdentidad`). Sin token o token inválido → **401**; rol inadecuado o clínica ajena → **403**.
 
 ---
 
 ## 10. Inicialización automática del esquema
 
-Al arrancar, la API ejecuta `Database.EnsureCreatedAsync()` (`Program.cs`) con reintentos
-contra la base: si la tabla `reservas` no existe, la crea. **No hay que cargar esquemas a
-mano.** La base `keycloakdb` (exclusiva del proveedor) la crea `db/init/01-keycloak-db.sql`
-la primera vez que se inicializa el volumen de PostgreSQL; separar bases evita que el
-esquema de Keycloak (decenas de tablas) haga que EF Core asuma que el de la app ya existe.
+Al arrancar, `scripts/api-entrypoint.sh` ejecuta `dotnet Project_Restaurant_API.dll --initialize-only` con reintentos contra la base: si las tablas del dominio no existen, ejecuta `001-schema.sql` y `002-seed.sql`, configura el usuario `medicitas_app` y luego limpia las variables de bootstrap antes de iniciar el servidor web. **No hay que cargar esquemas a mano.**
 
 ---
 
@@ -401,68 +322,27 @@ esquema de Keycloak (decenas de tablas) haga que EF Core asuma que el de la app 
 
 | Decisión | Justificación |
 |---|---|
-| `FROM mcr.microsoft.com/dotnet/sdk:8.0 AS build` | Imagen **base oficial** de Microsoft para .NET 8: contiene `dotnet restore`/`publish` para compilar el servicio y sus dependencias. |
-| Etapa de ejecución `FROM mcr.microsoft.com/dotnet/aspnet:8.0` | **Multi-stage**: la imagen final lleva solo el runtime ASP.NET, sin SDK ni herramientas de compilación → más pequeña y con menor superficie de ataque. |
-| `COPY . .` + `.dockerignore` | El contexto copia únicamente el código; el `.dockerignore` excluye de la imagen lo que no corresponde: historial `.git`, dependencias del entorno de desarrollo (`bin/`, `obj/`), secretos (`.env*`), el `Dockerfile`/compose, el README y `docs/`. |
-| `EXPOSE 8080` | Declara el puerto: las imágenes aspnet de .NET 8 escuchan en `8080` (`ASPNETCORE_HTTP_PORTS=8080`); el compose lo publica en el host. |
-| `ENTRYPOINT ["dotnet", "Project_Restaurant_API.dll"]` | Comando de arranque del proceso publicado. |
-| Sin secretos | No hay contraseñas ni en el `Dockerfile` ni en archivos copiados: todas las credenciales llegan por variables de entorno. |
+| `FROM mcr.microsoft.com/dotnet/sdk:8.0 AS build` | Imagen **base oficial** de Microsoft para .NET 8 para compilar y publicar el servicio. |
+| Etapa `FROM build AS tests` | Permite ejecutar `dotnet test` dentro de Docker sin depender del SDK instalado en el host. |
+| Etapa de ejecución `FROM mcr.microsoft.com/dotnet/aspnet:8.0` | **Multi-stage**: la imagen final lleva solo el runtime ASP.NET, sin SDK ni herramientas de compilación. |
+| `.dockerignore` | Excluye `.git`, `bin/`, `obj/`, `.env*` y documentación para reducir el contexto de compilación. |
+| `ENTRYPOINT ["/app/api-entrypoint.sh"]` | Inicializa la base de datos de forma idempotente y arranca el proceso en `:8080`. |
+
+---
 
 ## 12. Decisiones de orquestación (`docker-compose.yml`)
 
 | Decisión | Justificación |
 |---|---|
-| Red por **nombre de servicio** (`bd`, `auth`) | La app alcanza la base y el proveedor por nombre de servicio en la red que crea Compose, nunca por IP fija ni `localhost`. |
-| Volumen `postgres_data` | Los datos de PostgreSQL residen en un volumen declarado que sobrevive a `down`/`up` (persistencia verificada en la sección 5). |
-| `healthcheck` en los tres servicios | `bd` usa `pg_isready`; `auth` consulta `/health/ready` (9000); la app consulta `/health`. Así Compose sabe cuándo cada servicio está sano. |
-| `depends_on: condition: service_healthy` | La app **no se da por lista** hasta que PostgreSQL y Keycloak están sanos; Keycloak, hasta que la base lo está. Estrategia elegida: `depends_on` con condición de healthcheck (más `EnsureCreatedAsync` con reintentos dentro de la app como segunda red de seguridad). |
-| `--import-realm` + `keycloak/realm-export.json` | El realm se importa solo al arrancar: **cero pasos manuales** en la consola de Keycloak, clave para la reproducibilidad. |
-| `db/init/01-keycloak-db.sql` | Crea la base propia del proveedor la primera vez que se inicializa el volumen (los scripts de `docker-entrypoint-initdb.d` solo corren al inicializar). |
-| Configuración por entorno (`${VAR}`) | Todo valor sensible o de configuración sale de `.env` (con plantilla `.env.example`). |
-| `container_name` | Nombres fijos para simplificar los healthchecks y la depuración (opcional; no afecta la resolución por nombre de servicio). |
+| Red por **nombre de servicio** (`bd`, `redis`, `auth`) | La app alcanza la base, la caché y el proveedor por nombre de servicio en la red de Compose. |
+| Volumen `postgres_data` | Los datos de PostgreSQL residen en un volumen declarado que sobrevive a `down`/`up`. |
+| `healthcheck` en los cuatro servicios | `bd` usa `pg_isready`; `redis` usa `redis-cli ping`; `auth` consulta `/health/ready`; `api` consulta `/health`. |
+| `depends_on: condition: service_healthy` | La API espera a que PostgreSQL, Redis y Keycloak estén sanos antes de iniciar. |
+| `--import-realm` + `keycloak/realm-export.json` | El realm se importa solo al arrancar con cero pasos manuales en la consola de Keycloak. |
 
 ---
 
-## 13. Kubernetes y Kustomize (grupos de tres)
-
-El mismo sistema se despliega sobre un clúster local **kind** con manifiestos en
-`k8s/` (carpeta `base/` + overlay `local/`), con Kustomize. Cada concepto de Compose tiene
-su correspondiente en Kubernetes:
-
-| Compose | Kubernetes |
-|---|---|
-| servicio `api` (imagen propia) | `Deployment restaurant-api` + `Service` (ClusterIP) |
-| servicio `bd` (PostgreSQL) | `Deployment postgres` + `Service` + `PVC postgres-data` |
-| servicio `auth` (Keycloak) | `Deployment keycloak` + `Service` (ClusterIP) |
-| volumen `postgres_data` | `PersistentVolumeClaim` `postgres-data` |
-| healthchecks + `depends_on` | `startupProbe` / `livenessProbe` (/health) / `readinessProbe` (/ready) + `initContainers` que esperan a las dependencias |
-| variables de entorno (`.env`) | `ConfigMap restaurant-config` + `Secret restaurant-secrets` (secretGenerator del overlay) |
-| realm importado (`--import-realm`) | `initContainer` que renderiza el realm desde una plantilla (`k8s/base/keycloak/realm-template.json`) e importa con `--import-realm` |
-
-**Requisitos:** Docker, `kind` y `kubectl` en el PATH.
-
-**Comandos reproducibles** (se ejecutan desde la raíz del repositorio):
-
-```bash
-./scripts/k8s-up.sh                    # crea el clúster kind, carga la imagen, aplica el
-                                       # overlay y verifica que los Deployments queden listos
-# API desde el host: http://localhost:8081 (NodePort 30081 -> :8081)
-
-./scripts/k8s-run-integration.sh       # ejecuta el contrato completo con k6 (Job en el clúster)
-./scripts/k8s-run-persistence.sh       # escribe con k6, borra el Pod postgres, verifica que el
-                                       # dato sobrevive (PVC) y limpia
-./scripts/k8s-down.sh                  # elimina el clúster kind
-```
-
-La primera vez que se aplica el overlay, `k8s-up.sh` crea `k8s/overlays/local/secrets.env`
-desde la plantilla `secrets.env.example` (valores de desarrollo válidos; este archivo no se
-versiona). La imagen se construye con el mismo `Dockerfile` del repo y se carga en kind:
-
-```bash
-docker build -t restaurant-api:local .   # equivalente a lo que hace k8s-up.sh
-```
-
-## 14. Estructura del repositorio
+## 13. Estructura del repositorio
 
 ```
 .
@@ -473,54 +353,41 @@ docker build -t restaurant-api:local .   # equivalente a lo que hace k8s-up.sh
 ├── .gitignore                 # .env, bin/obj, etc. fuera del repositorio
 ├── db/init/01-keycloak-db.sql # base exclusiva de Keycloak (1er arranque del volumen)
 ├── keycloak/realm-export.json # realm de Keycloak importado al arrancar
-├── k8s/                       # manifiestos Kubernetes (módulo de grupo de tres)
-│   ├── base/                  # base de Kustomize (Deployments, Services, PVC, ConfigMap…)
-│   └── overlays/local/        # overlay local: kind-config, NodePort, Secret via Kustomize
-├── scripts/                   # k8s-up/down, k8s-run-* y run-compose-* (integración k6)
-├── tests/k6/                  # pruebas k6: contrato completo y persistencia
-├── INTEGRATION_CONTRACT.md    # contrato de integración coordinado entre partes
+├── docs/
+│   ├── DISENO.md              # diseño del modelo, multi-tenancy, RLS, caché e índices
+│   ├── PRUEBAS.md             # trazabilidad de pruebas a RF1..RF21 e I1..I8
+│   └── imgs/                  # diagrama de la base de datos
 ├── README.md
 ├── Project_Restaurant_API/                    # servicio ASP.NET Core 8
-│   ├── Program.cs                             # config, auth JWT, /health, /ready, esquema
-│   ├── Controllers/ReservasController.cs      # CRUD del recurso
-│   ├── Data/RestaurantContext.cs              # EF Core + Npgsql (tabla "reservas")
-│   ├── Models/Reserva.cs                      # entidad del dominio
-│   ├── Dtos/ReservaInputDto.cs / ReservaDto.cs
-│   └── Auth/KeycloakClaimsTransformation.cs   # roles de Keycloak → ClaimTypes.Role
-└── Project_Restaurant_API.Tests/              # 20 unitarias + 8 de integración
+│   ├── Program.cs                             # config, auth JWT, /health, /ready, Redis
+│   ├── Auth/KeycloakClaimsTransformation.cs   # roles de Keycloak → ClaimTypes.Role
+│   └── MediCitas/                             # controladores, acceso a SP_*, caché Redis y SQL
+└── Project_Restaurant_API.Tests/              # pruebas unitarias y de integración
 ```
 
-## 15. Declaración de uso de IA
+---
+
+## 14. Declaración de uso de IA
+
+Se utilizó inteligencia artificial como apoyo puntual para desarrollar y revisar algunas tareas específicas del proyecto:
 
 ##### [Josimar Araya]()
 
 - k6 – Pruebas de integración: Para facilitar la estructuración y revisión de los scripts de pruebas automatizadas sobre los endpoints ya definidos por el proyecto
-
 - k6 – Autenticación y persistencia: Apoyo en validación de escenarios con tokens de Keycloak, respuestas 401/403 y comprobaciones de persistencia desde las pruebas
-
 - Kubernetes – Manifiestos: Parcialmente para generar y revisar general de los Deployments, Services, PVC, ConfigMap, Secret y probes necesarios para desplegar el sistema
-
 - Kustomize y kind: Se utilizó para estructurar base/ y overlays/, configurar el clúster local con kind y revisar los comandos de despliegue
-
 - Además se usó en general para revisar y validar algunos códigos y flujo de proceso además de arreglar errores, fallas generales y problemas de código
 
-##### [Franco Rojas]()
+##### [Franco Rojas](https://github.com/frarojas)
 
--
-
--
-
--
+- Apoyo en la conexión del backend con los procedimientos almacenados de PostgreSQL (`SP_*`) y el manejo de la caché en Redis.
+- Apoyo puntual para adaptar las pruebas automatizadas al esquema de la base de datos y depurar errores de integración.
+- Consulta rápida de documentación y revisión de formato en archivos Markdown.
 
 ##### [José Jiménez](https://github.com/JoseJimenez01)
 
 - Refrescar términos, explicación del funcionamiento de algunas cosas(tecnologías, conexión entre componentes, etc).
-
 - Solución de errores.
-
 - Consultar la documentación rápidamente en busca de buenas prácticas de uso de cierta tecnología.
-
 - Si fuera el caso, para generar data de una BD, o generar los tests de prueba.
-
-
-
